@@ -29,8 +29,6 @@ end
 import TimespanLogging
 import TimespanLogging: timespan_start, timespan_finish
 
-import Adapt
-
 include("lib/util.jl")
 include("utils/dagdebug.jl")
 
@@ -92,6 +90,10 @@ include("ui/gantt-text.jl")
 include("utils/logging-events.jl")
 include("utils/logging.jl")
 
+include("fft.jl")
+#using .DaggerFFT
+#export DaggerFFT
+
 # Precompilation
 import PrecompileTools: @compile_workload
 include("precompile.jl")
@@ -117,9 +119,6 @@ function __init__()
                 # Gantt chart HTTP server
                 include("ui/gantt-mux.jl")
             end
-            @require JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1" begin
-                include(joinpath(dirname(@__DIR__), "ext", "JSON3Ext.jl"))
-            end
         end
         # TODO: Move to Pkg extensions
         @require ProfileSVG="132c30aa-f267-4189-9183-c8a63c7e05e6" begin
@@ -139,5 +138,6 @@ function __init__()
         end
     end
 end
+
 
 end # module
