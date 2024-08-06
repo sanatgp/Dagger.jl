@@ -2,16 +2,25 @@
 
 #module DaggerFFT
 #__precompile__(false)
+using Distributed
 
+function closest_factors(n)
+    factors = []
+    for i in 1:floor(Int, sqrt(n))
+        if n % i == 0
+            push!(factors, (i, div(n, i)))
+        end
+    end
 
-using AbstractFFTs
-using LinearAlgebra
-using FFTW
-using Dagger: DArray, @spawn, InOut, In
-using Dagger
-using CUDA, CUDA.CUFFT
-using Random
-using KernelAbstractions
+    # Sort the factors by the absolute difference between the two factors
+    sorted_factors = sort(factors, by = f -> abs(f[1] - f[2]))
+    return sorted_factors[1]
+end
+
+n = Distributed.nprocs()
+factors = closest_factors(n)
+
+using KernelAbstractions, AbstractFFTs, LinearAlgebra, FFTW, Dagger, CUDA, CUDA.CUFFT, Random
 
 
 struct FFT end
@@ -23,47 +32,50 @@ struct RFFT! end
 struct IRFFT! end
 struct IFFT! end
 
-
 export FFT, RFFT, IRFFT, IFFT, FFT!, RFFT!, IRFFT!, IFFT!, fft, ifft
 
 function plan_transform(transform, A, dims; kwargs...)
     if is_gpu_array(A)
-        if transform isa RFFT
-            return CUDA.CUFFT.plan_rfft(A, dims; kwargs...)
-        elseif transform isa FFT
+        if transform isa FFT
             return CUDA.CUFFT.plan_fft(A, dims; kwargs...)
-        elseif transform isa IRFFT
-            return CUDA.CUFFT.plan_irfft(A, dims; kwargs...)
         elseif transform isa IFFT
             return CUDA.CUFFT.plan_ifft(A, dims; kwargs...)
-        elseif transform isa RFFT!
-            return CUDA.CUFFT.plan_rfft!(A, dims; kwargs...)
         elseif transform isa FFT!
             return CUDA.CUFFT.plan_fft!(A, dims; kwargs...)
-        elseif transform isa IRFFT!
-            return CUDA.CUFFT.plan_irfft!(A, dims; kwargs...)
         elseif transform isa IFFT!
             return CUDA.CUFFT.plan_ifft!(A, dims; kwargs...)
         else
             throw(ArgumentError("Unknown transform type"))
         end
     else
-        if transform isa RFFT
-            return plan_rfft(A, dims; kwargs...)
-        elseif transform isa FFT
+        if transform isa FFT
             return plan_fft(A, dims; kwargs...)
-        elseif transform isa IRFFT
-            return plan_irfft(A, dims; kwargs...)
         elseif transform isa IFFT
             return plan_ifft(A, dims; kwargs...)
-        elseif transform isa RFFT!
-            return plan_rfft!(A, dims; kwargs...)
         elseif transform isa FFT!
             return plan_fft!(A, dims; kwargs...)
-        elseif transform isa IRFFT!
-            return plan_irfft!(A, dims; kwargs...)
         elseif transform isa IFFT!
             return plan_ifft!(A, dims; kwargs...)
+        else
+            throw(ArgumentError("Unknown transform type"))
+        end
+    end
+end
+
+function plan_transform(transform, A, dims, n; kwargs...)
+    if is_gpu_array(A)
+        if transform isa RFFT
+            return CUDA.CUFFT.plan_rfft(A, dims; kwargs...)
+        elseif transform isa IRFFT
+            return CUDA.CUFFT.plan_irfft(A, n, dims; kwargs...)
+        else
+            throw(ArgumentError("Unknown transform type"))
+        end
+    else
+        if transform isa RFFT
+            return plan_rfft(A, dims; kwargs...)
+        elseif transform isa IRFFT
+            return plan_irfft(A, n, dims; kwargs...)
         else
             throw(ArgumentError("Unknown transform type"))
         end
@@ -77,7 +89,8 @@ Base.getindex(arr::CuArray, d::ArrayDomain) = arr[indexes(d)...]
 Base.getindex(arr::KernelAbstractions.AbstractArray, d::ArrayDomain) = arr[indexes(d)...]
 
 function Base.similar(x::DArray{T,N}) where {T,N}
-    alloc(idx, sz) = CuArray{T,N}(undef, sz)
+    alloc(idx, sz) = KernelAbstractions.AbstractArray{T}(undef, sz)
+
     thunks = [Dagger.@spawn alloc(i, size(x)) for (i, x) in enumerate(x.subdomains)]
     return DArray(T, x.domain, x.subdomains, thunks, x.partitioning, x.concat)
 end
@@ -102,89 +115,124 @@ function is_gpu_array(A)
     return A isa CuArray
 end
 
-function apply_fft(a_part, transform, dim)
+function apply_fft!(out_part, a_part, transform, dim)
     plan = plan_transform(transform, a_part, dim)
-    if transform isa Union{FFT!, RFFT!, IRFFT!, IFFT!}
-        return plan * a_part  # In-place transform
+    if transform isa Union{FFT!, IFFT!}
+        out_part .= plan * a_part  # In-place transform
     else
-        return plan * a_part  # Out-of-place transform
+  #      result = plan * a_part  # Out-of-place transform
+  #      copyto!(out_part, result)  # Copy result to out_part
+           out_part .= plan * a_part 
     end
 end
 
-function fft(A::AbstractArray{T,3}, transforms, dims) where T
-        x, y, z = size(A)
-        a = DArray(A, Blocks(x, div(y, 2), div(z, 2)))
-        a_parts = a.chunks
-        b = DArray(similar(A), Blocks(div(x, 2), y, div(z, 2)))
-        b_parts = b.chunks
-        c = DArray(similar(A), Blocks(div(x, 2), div(y, 2), z))
-        c_parts = c.chunks
-        backend = get_backend(A)
+function apply_fft!(out_part, a_part, transform, dim, n)
+    plan = plan_transform(transform, a_part, dim, n)
+    out_part .= plan * a_part 
+end
 
-        Dagger.spawn_datadeps() do
-            for idx in 1:length(a_parts)
-                a_part = a_parts[idx]
-                a.chunks[idx] = Dagger.@spawn apply_fft(InOut(a_part), In(transforms[1]), In(dims[1]))
+function fft(A::AbstractArray{T,3}, transforms, dims) where T
+    x, y, z = size(A)
+    backend = get_backend(A)
+
+    if T <: Real
+        a = DArray(A, Blocks(x, div(y, 2), div(z, 2)))
+        buffer = DArray(ComplexF64.(A), Blocks(x, div(y, 2), div(z, 2)))
+        b = DArray(ComplexF64.(A), Blocks(div(x, 2), y, div(z, 2)))
+        c = DArray(ComplexF64.(A), Blocks(div(x, 2), div(y, 2), z))
+    else
+        a = DArray(A, Blocks(x, div(y, 2), div(z, 2)))
+        b = DArray(A, Blocks(div(x, 2), y, div(z, 2)))
+        c = DArray(A, Blocks(div(x, 2), div(y, 2), z))
+    end
+
+    Dagger.spawn_datadeps() do
+        if T <: Real
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                buffer_part = buffer.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]))
+            end
+
+            Dagger.@spawn copyto!(Out(b), In(buffer))
+        else
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
             end
             Dagger.@spawn copyto!(Out(b), In(a))
         end
 
-        Dagger.spawn_datadeps() do
-            for idx in 1:length(b_parts)
-                b_part = b.chunks[idx]
-                b.chunks[idx] = Dagger.@spawn apply_fft(InOut(b_part), In(transforms[2]), In(dims[2]))
-            end
-            Dagger.@spawn copyto!(Out(c), In(b))
+        for idx in 1:length(b.chunks)
+            b_part = b.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
         end
-        
-        Dagger.spawn_datadeps() do
-            for idx in 1:length(c_parts)
-                c_part = c.chunks[idx]
-                c.chunks[idx] = Dagger.@spawn apply_fft(InOut(c_part), In(transforms[3]), In(dims[3]))
-            end
+
+        Dagger.@spawn copyto!(Out(c), In(b))
+    
+        for idx in 1:length(c.chunks)
+            c_part = c.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(c_part), In(c_part), In(transforms[3]), In(dims[3]))
         end
+    end
 
     return AbstractCollect(c, backend)
 end
 
 function fft(A::AbstractArray{T,2}, transforms, dims) where T
     x, y = size(A)
-    a = DArray(A, Blocks(x, div(y, 2)))
-    a_parts = a.chunks
-    b = DArray(similar(A), Blocks(div(x, 2), y))
-    b_parts = b.chunks
-
-    Dagger.spawn_datadeps() do
-        for idx in 1:length(a_parts)
-            a_part = a_parts[idx]
-            a.chunks[idx] = Dagger.@spawn apply_fft(InOut(a_part), In(transforms[1]), In(dims[1]))
-        end
-        Dagger.@spawn copyto!(Out(b), In(a))
-    end
-
-    Dagger.spawn_datadeps() do
-        for idx in 1:length(b_parts)
-            b_part = b.chunks[idx]
-            b.chunks[idx] = Dagger.@spawn apply_fft(InOut(b_part), In(transforms[2]), In(dims[2]))
-        end
-    end
-    
     backend = get_backend(A)
+
+    if T <: Real
+        a = DArray(A, Blocks(x, div(y, 2)))
+        buffer = DArray(ComplexF64.(A), Blocks(x, div(y, 2)))
+        b = DArray(ComplexF64.(A), Blocks(div(x, 2), y))
+    else
+        a = DArray(A, Blocks(x, div(y, 2)))
+        b = DArray(A, Blocks(div(x, 2), y))
+    end
+
+    Dagger.spawn_datadeps() do
+        if T <: Real
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                buffer_part = buffer.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]))
+            end
+        else
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+            end
+        end
+
+        Dagger.@spawn copyto!(Out(b), In(buffer))
+
+        for idx in 1:length(b.chunks)
+            b_part = b.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
+        end
+    end
+
     return AbstractCollect(b, backend)
 end
 
 function fft(A::AbstractArray{T,1}, transforms, dims) where T
-    a = DArray(A, Blocks(length(A)))
-    a_parts = a.chunks
+    backend = get_backend(A)
+
+    if T <: Real
+        a = DArray(ComplexF64.(A), Blocks(length(A)))
+    else
+        a = DArray(A, Blocks(length(A)))
+    end
 
     Dagger.spawn_datadeps() do
-        for idx in 1:length(a_parts)
-            a_part = a_parts[idx]
-            a.chunks[idx] = Dagger.@spawn apply_fft(InOut(a_part), In(transforms[1]), In(dims[1]))
+        for idx in 1:length(a.chunks)
+            a_part = a.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms), In(dims))
         end
     end
-    
-    backend = get_backend(A)
+
     return AbstractCollect(a, backend)
 end
 
@@ -192,86 +240,237 @@ function fft(A::AbstractArray, transforms, dims)
     throw(ArgumentError("FFT not implemented for $(length(dims))-dimensional arrays"))
 end
 
-
 function ifft(A::AbstractArray{T,3}, transforms, dims) where T
-        x, y, z = size(A)
-        a = DArray(A, Blocks(div(x, 2), div(y, 2), z))
-        a_parts = a.chunks
-        b = DArray(similar(A), Blocks(div(x, 2), y, div(z, 2)))
-        b_parts = b.chunks
-        c = DArray(similar(A), Blocks(x, div(y, 2), div(z, 2)))
-        c_parts = c.chunks
+    x, y, z = size(A)
+    backend = get_backend(A)
 
-        Dagger.spawn_datadeps() do
-            for idx in 1:length(a_parts)
-                a_part = a_parts[idx]
-                a.chunks[idx] = Dagger.@spawn apply_fft(InOut(a_part), In(transforms[3]), In(dims[3]))
-            end
-            Dagger.@spawn copyto!(Out(b), In(a))
+    a = DArray(A, Blocks(div(x, 2), div(y, 2), z))
+    b = DArray(A, Blocks(div(x, 2), y, div(z, 2)))
+    c = DArray(A, Blocks(x, div(y, 2), div(z, 2)))
+
+    Dagger.spawn_datadeps() do
+        for idx in 1:length(a.chunks)
+            a_part = a.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[3]), In(dims[3]))
         end
 
-        Dagger.spawn_datadeps() do
-            for idx in 1:length(b_parts)
-                b_part = b.chunks[idx]
-                b.chunks[idx] = Dagger.@spawn apply_fft(InOut(b_part), In(transforms[2]), In(dims[2]))
-            end
-            Dagger.@spawn copyto!(Out(c), In(b))
+        Dagger.@spawn copyto!(Out(b), In(a))
+
+        for idx in 1:length(b.chunks)
+            b_part = b.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
         end
-        
-        Dagger.spawn_datadeps() do
-            for idx in 1:length(c_parts)
-                c_part = c.chunks[idx]
-                c.chunks[idx] = Dagger.@spawn apply_fft(InOut(c_part), In(transforms[1]), In(dims[1]))
-            end
+
+        Dagger.@spawn copyto!(Out(c), In(b))
+
+        for idx in 1:length(c.chunks)
+            c_part = c.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(c_part), In(c_part), In(transforms[1]), In(dims[1]))
         end
-    
-        backend = get_backend(A)
+    end
+
     return AbstractCollect(c, backend)
+
 end
 
+
 function ifft(A::AbstractArray{T,2}, transforms, dims) where T
-    x, y, z = size(A)
-    a = DArray(A, Blocks(div(x, 2), div(y, 2)))
-    a_parts = a.chunks
-    b = DArray(similar(A), Blocks(div(x, 2), y))
-    b_parts = b.chunks
-
-    Dagger.spawn_datadeps() do
-        for idx in 1:length(a_parts)
-            a_part = a_parts[idx]
-            a.chunks[idx] = Dagger.@spawn apply_fft(InOut(a_part), In(transforms[3]), In(dims[3]))
-        end
-        Dagger.@spawn copyto!(Out(b), In(a))
-    end
-
-    Dagger.spawn_datadeps() do
-        for idx in 1:length(b_parts)
-            b_part = b.chunks[idx]
-            b.chunks[idx] = Dagger.@spawn apply_fft(InOut(b_part), In(transforms[2]), In(dims[2]))
-        end
-    end
-
+    x, y = size(A)
+    a = DArray(A, Blocks(div(x, 2), y))
+    b = DArray(A, Blocks(x, div(y, 2)))
     backend = get_backend(A)
+
+    Dagger.spawn_datadeps() do
+        for idx in 1:length(a.chunks)
+            a_part = a.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[2]), In(dims[2]))
+        end
+
+        Dagger.@spawn copyto!(Out(b), In(a))
+
+        for idx in 1:length(b.chunks)
+            b_part = b.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[1]), In(dims[1]))
+        end
+    end
+
     return AbstractCollect(b, backend)
 end
 
 function ifft(A::AbstractArray{T,1}, transforms, dims) where T
-    x, y, z = size(A)
-    a = DArray(A, Blocks(div(x, 2), div(y, 2), z))
-    a_parts = a.chunks
+    a = DArray(A, Blocks(length(A)))
+    backend = get_backend(A)
 
     Dagger.spawn_datadeps() do
-        for idx in 1:length(a_parts)
-            a_part = a_parts[idx]
-            a.chunks[idx] = Dagger.@spawn apply_fft(InOut(a_part), In(transforms[3]), In(dims[3]))
+        for idx in 1:length(a.chunks)
+            a_part = a.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms), In(dims))
         end
     end
 
-    backend = get_backend(A)
     return AbstractCollect(a, backend)
 end
 
 function ifft(A::AbstractArray, transforms, dims)
+    throw(ArgumentError("IFFT not implemented for $(length(dims))-dimensional arrays"))
+end
+
+
+function rfft(A::AbstractArray{T,3}, transforms, dims) where T
+    x, y, z = size(A)
+    a = DArray(A, Blocks(x, div(y, 2), div(z, 2)))
+    buffer = DArray(ComplexF64.(A[1:div(x, 2) + 1, :, :]), Blocks(x, div(y, 2), div(z, 2)))
+    b = DArray(ComplexF64.(A[1:div(x, 2) + 1, :, :]), Blocks(div(x, 2), y, div(z, 2)))
+    c = DArray(ComplexF64.(A[1:div(x, 2) + 1, :, :]), Blocks(div(x, 2), div(y, 2), z))
+    backend = get_backend(A)
+
+    Dagger.spawn_datadeps() do
+        for idx in 1:length(a.chunks)
+            a_part = a.chunks[idx]
+            buffer_part = buffer.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]), In(z))
+        end
+        Dagger.@spawn copyto!(Out(b), In(buffer))
+
+        for idx in 1:length(b.chunks)
+            b_part = b.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
+        end
+
+        Dagger.@spawn copyto!(Out(c), In(b))
+
+        for idx in 1:length(c.chunks)
+            c_part = c.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(c_part), In(c_part), In(transforms[3]), In(dims[3]))
+        end
+    end
+
+    return AbstractCollect(c, backend)
+end
+
+function rfft(A::AbstractArray{T,2}, transforms, dims) where T
+    x, y = size(A)
+    a = DArray(A, Blocks(x, div(y, 2)))
+    buffer = DArray(ComplexF64.(A[1:div(x, 2) + 1, :]), Blocks(x, div(y, 2)))
+    b = DArray(ComplexF64.(A[1:div(x, 2) + 1, :]), Blocks(div(x, 2), y))
+    backend = get_backend(A)
+
+    Dagger.spawn_datadeps() do
+        for idx in 1:length(a.chunks)
+            a_part = a.chunks[idx]
+            buffer_part = buffer.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]), In(y))
+        end
+
+        Dagger.@spawn copyto!(Out(b), In(buffer))
+
+        for idx in 1:length(b.chunks)
+            b_part = b.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
+        end
+    end
+
+    return AbstractCollect(b, backend)
+end
+
+
+function rfft(A::AbstractArray{T,1}, transforms, dims) where T
+    a = DArray(A, Blocks(length(A)))
+    x = length(A)
+    buffer = DArray(ComplexF64.(A[1:div(x, 2) + 1]), Blocks(length(A)))
+    backend = get_backend(A)
+
+    Dagger.spawn_datadeps() do
+        for idx in 1:length(a.chunks)
+            a_part = a.chunks[idx]
+            buffer_part = buffer.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms), In(dims), In(x))
+        end
+    end
+    
+    return AbstractCollect(buffer, backend)
+end
+
+function rfft(A::AbstractArray, transforms, dims)
+    throw(ArgumentError("FFT not implemented for $(length(dims))-dimensional arrays"))
+end
+
+
+function irfft(A::AbstractArray{T,3}, transforms, dims) where T
+    x, y, z = size(A)
+    a = DArray(A, Blocks(div(x, 2), div(y, 2), z))
+    b = DArray(A, Blocks(div(x, 2), y, div(z, 2)))
+    c = DArray(A, Blocks(x, div(y, 2), div(z, 2)))
+    buffer = DArray(similar(A, Float64, ((x - 1) * 2, y, z)), Blocks(((x - 1) * 2), div(y, 2), div(z, 2)))
+    backend = get_backend(A)
+
+    Dagger.spawn_datadeps() do
+        for idx in 1:length(a.chunks)
+            a_part = a.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[3]), In(dims[3]))
+        end
+        Dagger.@spawn copyto!(Out(b), In(a))
+
+        for idx in 1:length(b.chunks)
+            b_part = b.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
+        end
+        Dagger.@spawn copyto!(Out(c), In(b))
+
+        for idx in 1:length(c.chunks)
+            c_part = c.chunks[idx]
+            buffer_part = buffer.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(buffer_part), In(c_part), In(transforms[1]), In(dims[1]), In(z))
+        end
+    end
+
+    return AbstractCollect(buffer, backend)
+
+end
+
+function irfft(A::AbstractArray{T,2}, transforms, dims) where T
+    x, y = size(A)
+    a = DArray(A, Blocks(x, div(y, 2)))
+    b = DArray(A, Blocks(div(x, 2) + 1, y))
+    buffer = DArray(similar(A, Float64, ((x - 1) * 2, y)), Blocks(((x - 1) * 2), div(y, 2)))
+    backend = get_backend(A)
+
+    Dagger.spawn_datadeps() do
+        for idx in 1:length(a.chunks)
+            a_part = a.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[2]), In(dims[2]))
+        end
+
+        Dagger.@spawn copyto!(Out(b), In(a))
+
+        for idx in 1:length(b.chunks)
+            b_part = b.chunks[idx]
+            buffer_part = buffer.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(buffer_part), In(b_part), In(transforms[1]), In(dims[1]), In(y))
+        end
+    end
+
+    return AbstractCollect(buffer, backend)
+end
+
+function irfft(A::AbstractArray{T,1}, transforms, dims) where T
+    x = length(A)
+    a = DArray(A, Blocks(length(A)))
+    buffer = DArray(similar(A, Float64, ((x - 1) * 2)), Blocks(((x - 1) * 2)))
+    backend = get_backend(A)
+
+    Dagger.spawn_datadeps() do
+        for idx in 1:length(a.chunks)
+            a_part = a.chunks[idx]
+            buffer_part = buffer.chunks[idx]
+            Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms), In(dims), In(x))
+        end
+    end
+
+    return AbstractCollect(buffer, backend)
+end
+
+function irfft(A::AbstractArray, transforms, dims)
     throw(ArgumentError("IFFT not implemented for $(length(dims))-dimensional arrays"))
 end
 
