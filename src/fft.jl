@@ -20,7 +20,7 @@ end
 n = Distributed.nprocs()
 factors = closest_factors(n)
 
-using KernelAbstractions, AbstractFFTs, LinearAlgebra, FFTW, Dagger, CUDA, CUDA.CUFFT, Random, GPUArrays
+using KernelAbstractions, AbstractFFTs, LinearAlgebra, FFTW, Dagger, CUDA, CUDA.CUFFT, Random, GPUArrays, AMDGPU
 
 
 const R2R_SUPPORTED_KINDS = (
@@ -217,7 +217,7 @@ function apply_fft!(out_part, a_part, transform, dim, n)
     plan = plan_transform(transform, a_part, dim, n)
     out_part .= plan * a_part 
 end
-
+"""
 function transpose_pencils(src::DArray, dst::DArray)
     for (src_idx, src_chunk) in enumerate(src.chunks)
         src_data = fetch(src_chunk)
@@ -246,13 +246,83 @@ function transpose_pencils(src::DArray, dst::DArray)
         end
     end
 end
+"""
+
+@kernel function transpose_kernel!(dst, src, src_size_x, src_size_y, src_size_z,
+                            dst_size_x, dst_size_y, dst_size_z,
+                            src_offset_x, src_offset_y, src_offset_z,
+                            dst_offset_x, dst_offset_y, dst_offset_z)
+    i, j, k = @index(Global, NTuple)
+
+    src_i = i + src_offset_x
+    src_j = j + src_offset_y
+    src_k = k + src_offset_z
+
+    dst_i = i + dst_offset_x
+    dst_j = j + dst_offset_y
+    dst_k = k + dst_offset_z
+
+    if src_i <= src_size_x && src_j <= src_size_y && src_k <= src_size_z &&
+        dst_i <= dst_size_x && dst_j <= dst_size_y && dst_k <= dst_size_z
+        dst[dst_i, dst_j, dst_k] = src[src_i, src_j, src_k]
+    end
+end
+
+function transpose_pencils(src::DArray, dst::DArray)
+    for (src_idx, src_chunk) in enumerate(src.chunks)
+        src_data = fetch(src_chunk)
+        for (dst_idx, dst_chunk) in enumerate(dst.chunks)
+            dst_domain = dst.subdomains[dst_idx]
+            src_domain = src.subdomains[src_idx]
+
+            intersect_domain = intersect(src_domain, dst_domain)
+
+            if !isempty(intersect_domain)
+
+                src_indices = relative_indices(intersect_domain, src_domain)
+                dst_indices = relative_indices(intersect_domain, dst_domain)
+
+                dst_chunk_data = fetch(dst_chunk)
+
+                if size(dst_chunk_data) != size(dst_domain)
+                  dst_chunk_data = similar(dst_chunk_data, size(dst_domain)...)
+                end
+
+                intersect_size = map(r -> length(r), intersect_domain.indexes)
+
+                #offsets
+                src_offset = map(r -> r.start - 1, src_indices)
+                dst_offset = map(r -> r.start - 1, dst_indices)
+
+                backend = get_backend(src_data)
+
+                kernel = transpose_kernel!(backend)
+                kernel(dst_chunk_data, src_data, 
+                  size(src_data)..., size(dst_chunk_data)...,
+                  src_offset..., dst_offset..., ndrange=intersect_size)
+                KernelAbstractions.synchronize(backend)
+
+                dst.chunks[dst_idx] = Dagger.tochunk(dst_chunk_data)
+            end
+        end
+    end         
+end
 
 function relative_indices(sub_domain, full_domain)
     return map(pair -> (pair[1].start:pair[1].stop) .- (pair[2].start - 1), 
                zip(sub_domain.indexes, full_domain.indexes))
 end
 
-
+"
+user should call the function with:
+    Dagger.fft(A, transforms, dims) #default pencil
+    Dagger.fft(A, transforms, dims, decomp=:pencil)
+    Dagger.fft(A, transforms, dims, decomp=:slab)
+    transforms = (FFT(), FFT(), FFT())
+or    transforms = [R2R(FFTW.REDFT10), R2R(FFTW.REDFT10), R2R(FFTW.REDFT10)]
+or    transforms = (RFFT(), FFT(), FFT())
+    dims = (1, 2, 3)
+"
 function fft(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{FFT,IFFT,RFFT,IRFFT,R2R,FFT!,IFFT!,R2R!}},
