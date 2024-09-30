@@ -3,23 +3,6 @@
 #module DaggerFFT
 #__precompile__(false)
 using Distributed
-
-function closest_factors(n)
-    factors = []
-    for i in 1:floor(Int, sqrt(n))
-        if n % i == 0
-            push!(factors, (i, div(n, i)))
-        end
-    end
-
-    # Sort the factors by the absolute difference between the two factors
-    sorted_factors = sort(factors, by = f -> abs(f[1] - f[2]))
-    return sorted_factors[1]
-end
-
-n = Distributed.nprocs()
-factors = closest_factors(n)
-
 using KernelAbstractions, AbstractFFTs, LinearAlgebra, FFTW, Dagger, CUDA, CUDA.CUFFT, Random, GPUArrays, AMDGPU
 
 
@@ -35,6 +18,23 @@ const R2R_SUPPORTED_KINDS = (
     FFTW.RODFT11,
 )
 
+"""
+DHT (Discrete Hartley Transform):
+The DHT is its own inverse, so forward and backward are the same.
+
+REDFT (Real Even Discrete Fourier Transform):
+REDFT00 (Type I DCT): Its own inverse (symmetric)
+REDFT10 (Type II DCT): Forward transform
+REDFT01 (Type III DCT): Backward transform (inverse of REDFT10)
+REDFT11 (Type IV DCT): Its own inverse (symmetric)
+
+RODFT (Real Odd Discrete Fourier Transform):
+RODFT00 (Type I DST): Its own inverse (symmetric)
+RODFT10 (Type II DST): Forward transform
+RODFT01 (Type III DST): Backward transform (inverse of RODFT10)
+RODFT11 (Type IV DST): Its own inverse (symmetric)
+"""
+
 struct FFT end
 struct RFFT end
 struct IRFFT end
@@ -44,6 +44,10 @@ struct RFFT! end
 struct IRFFT! end
 struct IFFT! end
 
+abstract type Decomposition end
+
+struct Pencil <: Decomposition end
+struct Slab <: Decomposition end
 
 export FFT, RFFT, IRFFT, IFFT, FFT!, RFFT!, IRFFT!, IFFT!, fft, ifft, R2R, R2R!
 
@@ -67,20 +71,20 @@ struct R2R!{K}
     end
 end
 
+# Get the number of processors
+const W = Distributed.nprocs()
+function find_factors(N)
+    n = Int(floor(sqrt(N)))
+    while N % n != 0
+        n -= 1
+    end
+    m = N ÷ n
+    return n, m
+end
+
+const n, m = find_factors(W)
+
 function plan_transform(transform, A, dims; kwargs...)
-    if is_gpu_array(A)
-        if transform isa FFT
-            return CUDA.CUFFT.plan_fft(A, dims; kwargs...)
-        elseif transform isa IFFT
-            return CUDA.CUFFT.plan_ifft(A, dims; kwargs...)
-        elseif transform isa FFT!
-            return CUDA.CUFFT.plan_fft!(A, dims; kwargs...)
-        elseif transform isa IFFT!
-            return CUDA.CUFFT.plan_ifft!(A, dims; kwargs...)
-        else
-            throw(ArgumentError("Unknown transform type"))
-        end
-    else
         if transform isa FFT
             return plan_fft(A, dims; kwargs...)
         elseif transform isa IFFT
@@ -96,19 +100,9 @@ function plan_transform(transform, A, dims; kwargs...)
         else
             throw(ArgumentError("Unknown transform type"))
         end
-    end
 end
 
 function plan_transform(transform, A, dims, n; kwargs...)
-    if is_gpu_array(A)
-        if transform isa RFFT
-            return CUDA.CUFFT.plan_rfft(A, dims; kwargs...)
-        elseif transform isa IRFFT
-            return CUDA.CUFFT.plan_irfft(A, n, dims; kwargs...)
-        else
-            throw(ArgumentError("Unknown transform type"))
-        end
-    else
         if transform isa RFFT
             return plan_rfft(A, dims; kwargs...)
         elseif transform isa IRFFT
@@ -116,7 +110,6 @@ function plan_transform(transform, A, dims, n; kwargs...)
         else
             throw(ArgumentError("Unknown transform type"))
         end
-    end
 end
 
 kind(transform::R2R) = transform.kind
@@ -133,44 +126,14 @@ function plan_transform(transform::Union{R2R, R2R!}, A, dims; kwargs...)
     end
 end
 
-indexes(a::ArrayDomain) = a.indexes
 
-Base.getindex(arr::CuArray, d::ArrayDomain) = arr[indexes(d)...]
-
-Base.getindex(arr::KernelAbstractions.AbstractArray, d::ArrayDomain) = arr[indexes(d)...]
-
-Base.getindex(arr::GPUArrays.AbstractGPUArray, d::ArrayDomain) = arr[indexes(d)...]
-
-function Base.similar(x::DArray{T,N}) where {T,N}
-    alloc(idx, sz) = KernelAbstractions.AbstractArray{T}(undef, sz)
-
-    thunks = [Dagger.@spawn alloc(i, size(x)) for (i, x) in enumerate(x.subdomains)]
-    return DArray(T, x.domain, x.subdomains, thunks, x.partitioning, x.concat)
-end
-
-function AbstractCollect(d::DArray{T,N}, backend=KernelAbstractions.CPU()) where {T,N}
-    total_size = size(d)
-    result = KernelAbstractions.zeros(backend, T, total_size...)
-    
-    for (idx, chunk) in enumerate(d.chunks)
-        chunk_domain = d.subdomains[idx]
-        fetched_chunk = fetch(chunk)
-        
-        # Copy the chunk data to the appropriate part of the result array
-        indices = map(r -> r.start:r.stop, chunk_domain.indexes)
-        result[indices...] = fetched_chunk
-    end
-    
-    return result
-end
-
-function create_darray(A::AbstractArray{T,N}, blocks::Blocks{N}) where {T,N} #TODO:Creates view?
+function create_darray(A::AbstractArray{T,N}, blocks::Blocks{N}) where {T,N}
     domain = ArrayDomain(map(Base.OneTo, size(A)))
     
     #calculate subdomain
     dims = size(A)
     block_sizes = blocks.blocksize
-    subdomain_sizes = map((d, b) -> [b for _ in 1:ceil(Int, d/b)], dims, block_sizes)
+    subdomain_sizes = map((d, b) -> [b for _ in 1:ceil(Int, d/b)], dims, block_sizes) #round_up
     subdomain_cumlengths = map(cumsum, subdomain_sizes)
     
     #create subdomains
@@ -198,9 +161,6 @@ function create_darray(A::AbstractArray{T,N}, blocks::Blocks{N}) where {T,N} #TO
     )
 end
 
-function is_gpu_array(A)
-    return A isa Union{CuArray, ROCArray}
-end
 
 function apply_fft!(out_part, a_part, transform, dim)
     plan = plan_transform(transform, a_part, dim)
@@ -217,41 +177,12 @@ function apply_fft!(out_part, a_part, transform, dim, n)
     plan = plan_transform(transform, a_part, dim, n)
     out_part .= plan * a_part 
 end
-"""
-function transpose_pencils(src::DArray, dst::DArray)
-    for (src_idx, src_chunk) in enumerate(src.chunks)
-        src_data = fetch(src_chunk)
-        for (dst_idx, dst_chunk) in enumerate(dst.chunks)
-            dst_domain = dst.subdomains[dst_idx]
-            src_domain = src.subdomains[src_idx]
-            
-            #Calculate the intersection of source and destination domains
-            intersect_domain = intersect(src_domain, dst_domain)
-            
-            if !isempty(intersect_domain)
-                #calculate relative indices
-                src_indices = relative_indices(intersect_domain, src_domain)
-                dst_indices = relative_indices(intersect_domain, dst_domain)
-                
-                dst_chunk_data = fetch(dst_chunk)
-                
-                if size(dst_chunk_data) != size(dst_domain)
-                    dst_chunk_data = similar(dst_chunk_data, size(dst_domain)...)
-                end
-                
-                #Scatter
-                dst_chunk_data[dst_indices...] = src_data[src_indices...]
-                dst.chunks[dst_idx] = Dagger.tochunk(dst_chunk_data)
-            end
-        end
-    end
-end
-"""
+
 
 @kernel function transpose_kernel!(dst, src, src_size_x, src_size_y, src_size_z,
-                            dst_size_x, dst_size_y, dst_size_z,
-                            src_offset_x, src_offset_y, src_offset_z,
-                            dst_offset_x, dst_offset_y, dst_offset_z)
+    dst_size_x, dst_size_y, dst_size_z,
+    src_offset_x, src_offset_y, src_offset_z,
+    dst_offset_x, dst_offset_y, dst_offset_z)
     i, j, k = @index(Global, NTuple)
 
     src_i = i + src_offset_x
@@ -268,7 +199,71 @@ end
     end
 end
 
-function transpose_pencils(src::DArray, dst::DArray)
+function transpose(src::DArray{T,3}, dst::DArray{T,3})
+    for (src_idx, src_chunk) in enumerate(src.chunks)
+        src_data = fetch(src_chunk)
+        for (dst_idx, dst_chunk) in enumerate(dst.chunks)
+          dst_domain = dst.subdomains[dst_idx]
+          src_domain = src.subdomains[src_idx]
+
+          intersect_domain = intersect(src_domain, dst_domain)
+
+          if !isempty(intersect_domain)
+
+            src_indices = relative_indices(intersect_domain, src_domain)
+            dst_indices = relative_indices(intersect_domain, dst_domain)
+
+            dst_chunk_data = fetch(dst_chunk)
+
+            if size(dst_chunk_data) != size(dst_domain)
+                dst_chunk_data = similar(dst_chunk_data, size(dst_domain)...)
+            end
+
+            intersect_size = map(r -> length(r), intersect_domain.indexes)
+
+            #offsets
+            src_offset = map(r -> r.start - 1, src_indices)
+            dst_offset = map(r -> r.start - 1, dst_indices)
+
+            backend = get_backend(src_data)
+
+            kernel = transpose_kernel!(backend)
+            kernel(dst_chunk_data, src_data, 
+            size(src_data)..., size(dst_chunk_data)...,
+            src_offset..., dst_offset..., ndrange=intersect_size)
+            KernelAbstractions.synchronize(backend)
+
+            dst.chunks[dst_idx] = Dagger.tochunk(dst_chunk_data)
+          end
+        end
+    end         
+end
+
+
+function relative_indices(sub_domain, full_domain)
+    return map(pair -> (pair[1].start:pair[1].stop) .- (pair[2].start - 1), 
+    zip(sub_domain.indexes, full_domain.indexes))
+end
+
+@kernel function transpose_kernel_2d!(dst, src, src_size_x, src_size_y,
+    dst_size_x, dst_size_y,
+    src_offset_x, src_offset_y,
+    dst_offset_x, dst_offset_y)
+    i, j = @index(Global, NTuple)
+
+    src_i = i + src_offset_x
+    src_j = j + src_offset_y
+
+    dst_i = i + dst_offset_x
+    dst_j = j + dst_offset_y
+
+    if src_i <= src_size_x && src_j <= src_size_y &&
+       dst_i <= dst_size_x && dst_j <= dst_size_y
+        dst[dst_i, dst_j] = src[src_i, src_j]
+    end
+end
+
+function transpose(src::DArray{T,2}, dst::DArray{T,2}) where T
     for (src_idx, src_chunk) in enumerate(src.chunks)
         src_data = fetch(src_chunk)
         for (dst_idx, dst_chunk) in enumerate(dst.chunks)
@@ -278,28 +273,27 @@ function transpose_pencils(src::DArray, dst::DArray)
             intersect_domain = intersect(src_domain, dst_domain)
 
             if !isempty(intersect_domain)
-
                 src_indices = relative_indices(intersect_domain, src_domain)
                 dst_indices = relative_indices(intersect_domain, dst_domain)
 
                 dst_chunk_data = fetch(dst_chunk)
 
                 if size(dst_chunk_data) != size(dst_domain)
-                  dst_chunk_data = similar(dst_chunk_data, size(dst_domain)...)
+                    dst_chunk_data = similar(dst_chunk_data, size(dst_domain)...)
                 end
 
                 intersect_size = map(r -> length(r), intersect_domain.indexes)
 
-                #offsets
+                # Offsets
                 src_offset = map(r -> r.start - 1, src_indices)
                 dst_offset = map(r -> r.start - 1, dst_indices)
 
                 backend = get_backend(src_data)
 
-                kernel = transpose_kernel!(backend)
+                kernel = transpose_kernel_2d!(backend)
                 kernel(dst_chunk_data, src_data, 
-                  size(src_data)..., size(dst_chunk_data)...,
-                  src_offset..., dst_offset..., ndrange=intersect_size)
+                       size(src_data)..., size(dst_chunk_data)...,
+                       src_offset..., dst_offset..., ndrange=intersect_size)
                 KernelAbstractions.synchronize(backend)
 
                 dst.chunks[dst_idx] = Dagger.tochunk(dst_chunk_data)
@@ -308,111 +302,52 @@ function transpose_pencils(src::DArray, dst::DArray)
     end         
 end
 
-function relative_indices(sub_domain, full_domain)
-    return map(pair -> (pair[1].start:pair[1].stop) .- (pair[2].start - 1), 
-               zip(sub_domain.indexes, full_domain.indexes))
-end
 
 "
 user should call the function with:
     Dagger.fft(A, transforms, dims) #default pencil
-    Dagger.fft(A, transforms, dims, decomp=:pencil)
-    Dagger.fft(A, transforms, dims, decomp=:slab)
+    Dagger.fft(A, transforms, dims, decomp=pencil())
+    Dagger.fft(A, transforms, dims, decomp=Slab())
     transforms = (FFT(), FFT(), FFT())
-or    transforms = [R2R(FFTW.REDFT10), R2R(FFTW.REDFT10), R2R(FFTW.REDFT10)]
+or    transforms = (R2R(FFTW.REDFT10), R2R(FFTW.REDFT10), R2R(FFTW.REDFT10))
 or    transforms = (RFFT(), FFT(), FFT())
     dims = (1, 2, 3)
 "
+#out-of-place
 function fft(
     A::AbstractArray{T,N},
-    transforms::NTuple{N,Union{FFT,IFFT,RFFT,IRFFT,R2R,FFT!,IFFT!,R2R!}},
+    transforms::NTuple{N,Union{FFT,RFFT,R2R}},
     dims::NTuple{N,Int};
-    decomp::Union{Symbol,Nothing}=nothing
+    decomp::Union{Pencil,Nothing} = nothing
 ) where {T,N}
-    # default to pencil decomposition
-    decomp = isnothing(decomp) ? :pencil : decomp
 
-    if decomp ∉ [:pencil, :slab]
-        throw(ArgumentError("Invalid decomposition type. Use :pencil or :slab"))
-    end
-
-    if N == 3
-        x, y, z = size(A)
-        backend = get_backend(A)
-
-        if transforms[1] isa RFFT
-            a = DArray(A, Blocks(x, div(y, 2), div(z, 2)))
-            buffer = DArray(ComplexF64.(A[1:div(x, 2) + 1, :, :]), Blocks(div(x, 2) + 1, div(y, 2), div(z, 2)))
-            b = DArray(ComplexF64.(A[1:div(x, 2) + 1, :, :]), decomp == :pencil ? Blocks(div(x, 2) + 1, y, div(z, 2)) : Blocks(div(x, 2) + 1, y, div(z, 2)))
-            c = DArray(ComplexF64.(A[1:div(x, 2) + 1, :, :]), Blocks(div(x, 2) + 1, div(y, 2), z))
-        elseif T <: Real && all(transform -> transform isa FFT, transforms)
-            a = DArray(A, Blocks(x, div(y, 2), div(z, 2)))
-            buffer = DArray(ComplexF64.(A), Blocks(x, div(y, 2), div(z, 2)))
-            b = DArray(ComplexF64.(A), decomp == :pencil ? Blocks(div(x, 2), y, div(z, 2)) : Blocks(x, y, div(z, 2)))
-            c = DArray(ComplexF64.(A), Blocks(div(x, 2), div(y, 2), z))
-        else
-            a = DArray(A, Blocks(x, div(y, 2), div(z, 2)))
-            b = DArray(A, decomp == :pencil ? Blocks(div(x, 2), y, div(z, 2)) : Blocks(x, y, div(z, 2)))
-            c = DArray(A, Blocks(div(x, 2), div(y, 2), z))
-        end
+    if N == 1
+        x = size(A, 1)
+        a = DArray(A, Blocks(div(x, W)))
 
         Dagger.spawn_datadeps() do
-            if transforms[1] isa RFFT
-                for idx in 1:length(a.chunks)
-                    a_part = a.chunks[idx]
-                    buffer_part = buffer.chunks[idx]
-                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]), In(z))
-                end
-                Dagger.@spawn transpose_pencils(In(buffer), Out(b))
-            elseif T <: Real && all(transform -> transform isa FFT, transforms)
-                for idx in 1:length(a.chunks)
-                    a_part = a.chunks[idx]
-                    buffer_part = buffer.chunks[idx]
-                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]))
-                end
-                Dagger.@spawn transpose_pencils(In(buffer), Out(b))
-            else
-                for idx in 1:length(a.chunks)
-                    a_part = a.chunks[idx]
-                    Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
-                end
-                if decomp == :pencil
-                    Dagger.@spawn transpose_pencils(In(a), Out(b))
-                else
-                    b = a  # For slabs, skip the first transpose
-                end
-            end
-
-            for idx in 1:length(b.chunks)
-                b_part = b.chunks[idx]
-                Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
-            end
-
-            Dagger.@spawn transpose_pencils(In(b), Out(c))
-        
-            for idx in 1:length(c.chunks)
-                c_part = c.chunks[idx]
-                Dagger.@spawn apply_fft!(Out(c_part), In(c_part), In(transforms[3]), In(dims[3]))
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
             end
         end
 
-        return AbstractCollect(c, backend)
+        return collect(a)
 
     elseif N == 2
         x, y = size(A)
-        backend = get_backend(A)
 
-        if transforms[1] isa RFFT
-            a = DArray(A, Blocks(x, div(y, 2)))
-            buffer = DArray(ComplexF64.(A[1:div(x, 2) + 1, :]), Blocks(div(x, 2) + 1, div(y, 2)))
-            b = DArray(ComplexF64.(A[1:div(x, 2) + 1, :]), Blocks(div(x, 2) + 1, y))
-        elseif T <: Real
-            a = DArray(A, decomp == :pencil ? Blocks(x, div(y, 2)) : Blocks(x, y))
-            buffer = DArray(ComplexF64.(A), decomp == :pencil ? Blocks(x, div(y, 2)) : Blocks(x, y))
-            b = DArray(ComplexF64.(A), Blocks(div(x, 2), y))
-        else
-            a = DArray(A, decomp == :pencil ? Blocks(x, div(y, 2)) : Blocks(x, y))
-            b = DArray(A, Blocks(div(x, 2), y))
+        if transforms[1] isa RFFT # R2C
+            a = DArray(A, Blocks(x, div(y, m)))
+            buffer = DArray(ComplexF64.(A[1:div(x, 2) + 1, :]), Blocks(div(x, 2) + 1, div(y, m)))
+            b = DArray(ComplexF64.(A[1:div(x, 2) + 1, :]), Blocks(div(x, (2*n)) + 1, y))
+        elseif T <: Real && all(transform -> transform isa FFT, transforms) # R2C
+            a = DArray(A, Blocks(x, div(y, m)))
+            buffer = DArray(ComplexF64.(A), Blocks(x, div(y, m)))
+            b = DArray(ComplexF64.(A), Blocks(div(x, n), y))
+        else # C2C or R2R
+            a = DArray(A, Blocks(x, div(y, m)))
+            b = DArray(A, Blocks(div(x, n), y))
         end
 
         Dagger.spawn_datadeps() do
@@ -422,24 +357,20 @@ function fft(
                     buffer_part = buffer.chunks[idx]
                     Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]), In(y))
                 end
-                Dagger.@spawn transpose_pencils(In(buffer), Out(b))
-            elseif T <: Real
+                Dagger.@spawn transpose(In(buffer), Out(b))
+            elseif T <: Real && all(transform -> transform isa FFT, transforms)
                 for idx in 1:length(a.chunks)
                     a_part = a.chunks[idx]
                     buffer_part = buffer.chunks[idx]
                     Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]))
                 end
-                Dagger.@spawn transpose_pencils(In(buffer), Out(b))
+                Dagger.@spawn transpose(In(buffer), Out(b))
             else
                 for idx in 1:length(a.chunks)
                     a_part = a.chunks[idx]
                     Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
                 end
-                if decomp == :pencil
-                    Dagger.@spawn transpose_pencils(In(a), Out(b))
-                else
-                    b = a  # For slabs, skip the transpose
-                end
+                Dagger.@spawn transpose(In(a), Out(b))
             end
 
             for idx in 1:length(b.chunks)
@@ -448,131 +379,455 @@ function fft(
             end
         end
 
-        return AbstractCollect(b, backend)
+        return collect(b)
 
-    elseif N == 1
-        backend = get_backend(A)
+    elseif N == 3
+        x, y, z = size(A)
 
-        if transforms[1] isa RFFT
-            a = DArray(A, Blocks(length(A)))
-            x = length(A)
-            buffer = DArray(ComplexF64.(A[1:div(x, 2) + 1]), Blocks(div(x, 2) + 1))
-            
-            Dagger.spawn_datadeps() do
+        if transforms[1] isa RFFT #R2C
+            a =  DArray(A, Blocks(x, div(y, n), div(z, m)))
+            buffer = DArray(ComplexF64.(A[1:div(x, 2) + 1, :, :]), Blocks(div(x, 2) + 1, div(y, n), div(z, m)))
+            b = DArray(ComplexF64.(A[1:div(x, 2) + 1, :, :]), Blocks(div(x, (2*n)) + 1, y, div(z, m)))
+            c = DArray(ComplexF64.(A[1:div(x, 2) + 1, :, :]), Blocks(div(x, (2*n)) + 1, div(y, m), z))
+        elseif T <: Real && all(transform -> transform isa FFT, transforms) #R2C
+            a =  DArray(A, Blocks(x, div(y, n), div(z, m)))
+            buffer = DArray(ComplexF64.(A), Blocks(x, div(y, n), div(z, m)))
+            b = DArray(ComplexF64.(A), Blocks(div(x, n), y, div(z, m))) 
+            c = DArray(ComplexF64.(A), Blocks(div(x, n), div(y, m), z))
+        else #C2C R2R
+        a =  DArray(A, Blocks(x, div(y, n), div(z, m)))
+        b =  DArray(A, Blocks(div(x, n), y, div(z, m)))
+        c =  DArray(A, Blocks(div(x, n), div(y, m), z))
+        end
+
+        Dagger.spawn_datadeps() do
+            if transforms[1] isa RFFT
                 for idx in 1:length(a.chunks)
                     a_part = a.chunks[idx]
                     buffer_part = buffer.chunks[idx]
-                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]), In(x))
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]), In(z))
                 end
-            end
-            
-            return AbstractCollect(buffer, backend)
-        else
-            if T <: Real
-                a = DArray(ComplexF64.(A), Blocks(length(A)))
-            else
-                a = DArray(A, Blocks(length(A)))
-            end
-
-            Dagger.spawn_datadeps() do
+                Dagger.@spawn transpose(In(buffer), Out(b))
+            elseif T <: Real && all(transform -> transform isa FFT, transforms)
                 for idx in 1:length(a.chunks)
                     a_part = a.chunks[idx]
-                    Dagger.@spawn apply_fft!(Out(a_part), In(a_part), transforms[1], In(dims[1]))
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]))
                 end
+                Dagger.@spawn transpose(In(buffer), Out(b))
+            else
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+                end
+                Dagger.@spawn transpose(In(a), Out(b))
+
             end
 
-            return AbstractCollect(a, backend)
+            for idx in 1:length(b.chunks)
+                b_part = b.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
+            end
+
+            Dagger.@spawn transpose(In(b), Out(c))
+        
+            for idx in 1:length(c.chunks)
+                c_part = c.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(c_part), In(c_part), In(transforms[3]), In(dims[3]))
+            end
         end
 
+        return collect(c)
     else
-        throw(ArgumentError("FFT not implemented for $(N)-dimensional arrays"))
+        error("This function only supports 1D, 2D, and 3D arrays")
     end
 end
-function ifft(
+
+function fft(
     A::AbstractArray{T,N},
-    transforms::NTuple{N,Union{FFT,IFFT,RFFT,IRFFT,R2R,FFT!,IFFT!,R2R!}},
+    transforms::NTuple{N,Union{FFT,RFFT,R2R}},
     dims::NTuple{N,Int};
-    decomp::Union{Symbol,Nothing}=nothing
+    decomp::Slab
 ) where {T,N}
-    # default pencil decomposition
-    decomp = isnothing(decomp) ? :pencil : decomp
 
-    if decomp ∉ [:pencil, :slab]
-        throw(ArgumentError("Invalid decomposition type. Use :pencil or :slab"))
-    end
-
-    if N == 3
-        x, y, z = size(A)
-        backend = get_backend(A)
-
-        if transforms[1] isa IRFFT
-            a = DArray(A, Blocks(div(x, 2), div(y, 2), z))
-            b = DArray(A, Blocks(div(x, 2), y, div(z, 2)))
-            c = DArray(A, Blocks(x, div(y, 2), div(z, 2)))
-            buffer = DArray(similar(A, Float64, ((x - 1) * 2, y, z)), Blocks(((x - 1) * 2), div(y, 2), div(z, 2)))
-        else
-            if decomp == :pencil
-                a = DArray(A, Blocks(div(x, 2), div(y, 2), z))
-                b = DArray(A, Blocks(div(x, 2), y, div(z, 2)))
-                c = DArray(A, Blocks(x, div(y, 2), div(z, 2)))
-            else # :slab
-                a = DArray(A, Blocks(x, y, div(z, 2)))
-                b = DArray(A, Blocks(x, y, div(z, 2)))
-                c = DArray(A, Blocks(x, y, div(z, 2)))
-            end
-        end
+    if N == 1
+        x = size(A, 1)
+        a = DArray(A, Blocks(div(x, W)))
 
         Dagger.spawn_datadeps() do
             for idx in 1:length(a.chunks)
                 a_part = a.chunks[idx]
-                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[3]), In(dims[3]))
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
             end
+        end
 
-            if decomp == :pencil
-                Dagger.@spawn transpose_pencils(In(a), Out(b))
+        return collect(a)
+
+    elseif N == 2
+        x, y = size(A)
+
+        if transforms[1] isa RFFT # R2C
+            a = DArray(A, Blocks(x, div(y, W)))
+            buffer = DArray(ComplexF64.(A[1:div(x, 2) + 1, :]), Blocks(div(x, 2) + 1, div(y, W)))
+            b = DArray(ComplexF64.(A[1:div(x, 2) + 1, :]), Blocks(div(x, (2*W)) + 1, y))
+        elseif T <: Real && all(transform -> transform isa FFT, transforms) # R2C
+            a = DArray(A, Blocks(x, div(y, W)))
+            buffer = DArray(ComplexF64.(A), Blocks(x, div(y, W)))
+            b = DArray(ComplexF64.(A), Blocks(div(x, W), y))
+        else # C2C or R2R
+            a = DArray(A, Blocks(x, div(y, W)))
+            b = DArray(A, Blocks(div(x, W), y))
+        end
+
+        Dagger.spawn_datadeps() do
+            if transforms[1] isa RFFT
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]), In(y))
+                end
+                Dagger.@spawn transpose(In(buffer), Out(b))
+            elseif T <: Real && all(transform -> transform isa FFT, transforms)
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]))
+                end
+                Dagger.@spawn transpose(In(buffer), Out(b))
             else
-                b = a 
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+                end
+                Dagger.@spawn transpose(In(a), Out(b))
             end
 
             for idx in 1:length(b.chunks)
                 b_part = b.chunks[idx]
                 Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
             end
+        end
 
-            Dagger.@spawn transpose_pencils(In(b), Out(c))
+        return collect(b)
 
-            if transforms[1] isa IRFFT
-                for idx in 1:length(c.chunks)
-                    c_part = c.chunks[idx]
+    elseif N == 3
+        x, y, z = size(A)
+
+        if transforms[1] isa RFFT #R2C
+            a =  DArray(A, Blocks(x, y, div(z, W)))
+            buffer = DArray(ComplexF64.(A[1:div(x, 2) + 1, :, :]), Blocks(div(x, 2) + 1, y, div(z, W)))
+            b = DArray(ComplexF64.(A[1:div(x, 2) + 1, :, :]), Blocks(div(x, (2*n)) + 1, div(y, m), z))
+        elseif T <: Real && all(transform -> transform isa FFT, transforms) #R2C
+            a =  DArray(A, Blocks(x, y, div(z, W)))
+            buffer = DArray(ComplexF64.(A), Blocks(x, y, div(z, W)))
+            b = DArray(ComplexF64.(A), Blocks(div(x, n), div(y, m), z)) 
+        else #C2C
+            a =  DArray(A, Blocks(x, y, div(z, W)))
+            b =  DArray(A, Blocks(div(x, n), div(y, m), z))
+        end
+
+        Dagger.spawn_datadeps() do
+            if transforms[1] isa RFFT
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
                     buffer_part = buffer.chunks[idx]
-                    Dagger.@spawn apply_fft!(Out(buffer_part), In(c_part), In(transforms[1]), In(dims[1]), In(z))
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), (dims[1], dims[2]), In(z))
                 end
-                return AbstractCollect(buffer, backend)
+                Dagger.@spawn transpose(In(buffer), Out(b))
+            elseif T <: Real && all(transform -> transform isa FFT, transforms)
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), (dims[1], dims[2]))
+                end
+                Dagger.@spawn transpose(In(buffer), Out(b))
             else
-                for idx in 1:length(c.chunks)
-                    c_part = c.chunks[idx]
-                    Dagger.@spawn apply_fft!(Out(c_part), In(c_part), In(transforms[1]), In(dims[1]))
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), (dims[1], dims[2]))
                 end
-                return AbstractCollect(c, backend)
+                Dagger.@spawn transpose(In(a), Out(b))
+            end
+
+            for idx in 1:length(b.chunks)
+                b_part = b.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[3]), In(dims[3]))
             end
         end
 
+        return collect(b)
+    else
+        error("This function only supports 1D, 2D, and 3D arrays")
+    end
+end
+
+#in-place
+function fft!(
+    A::AbstractArray{T,N},
+    transforms::NTuple{N,Union{FFT!,RFFT!,R2R!}},
+    dims::NTuple{N,Int};
+    decomp::Union{Pencil,Nothing} = nothing
+) where {T,N}
+
+    if N == 1
+        x = size(A, 1)
+        a = create_darray(A, Blocks(div(x, W)))
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+            end
+        end
+
+        return collect(a)
+
     elseif N == 2
         x, y = size(A)
-        backend = get_backend(A)
 
-        if transforms[1] isa IRFFT
-            a = DArray(A, Blocks(div(x, 2), y))
-            b = DArray(A, Blocks(x, div(y, 2)))
-            buffer = DArray(similar(A, Float64, ((x - 1) * 2, y)), Blocks(((x - 1) * 2), div(y, 2)))
-        else
-            if decomp == :pencil
-                a = DArray(A, Blocks(div(x, 2), y))
-                b = DArray(A, Blocks(x, div(y, 2)))
-            else # :slab
-                a = DArray(A, Blocks(x, div(y, 2)))
-                b = DArray(A, Blocks(x, div(y, 2)))
+        if transforms[1] isa RFFT! #R2C
+            a = create_darray(A, Blocks(x, div(y, m)))
+            buffer = create_darray(A[1:div(x, 2) + 1, :], Blocks(div(x, 2) + 1, div(y, m)))
+            b = create_darray(A[1:div(x, 2) + 1, :], Blocks(div(x, (2*n)) + 1, y))
+        elseif T <: Real && all(transform -> transform isa FFT!, transforms) #R2C
+            a = create_darray(A, Blocks(x, div(y, m)))
+            buffer = create_darray(A, Blocks(x, div(y, m)))
+            b = create_darray(A, Blocks(div(x, n), y))
+        else #C2C or R2R
+            a = create_darray(A, Blocks(x, div(y, m)))
+            b = create_darray(A, Blocks(div(x, n), y))
+        end
+
+        Dagger.spawn_datadeps() do
+            if transforms[1] isa RFFT!
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]), In(y))
+                end
+            elseif T <: Real && all(transform -> transform isa FFT!, transforms)
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]))
+                end
+            else
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+                end
             end
+
+            for idx in 1:length(b.chunks)
+                b_part = b.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
+            end
+        end
+
+        return collect(b)
+
+    elseif N == 3
+        x, y, z = size(A)
+
+        if transforms[1] isa RFFT! #R2C
+            a =  create_darray(A, Blocks(x, div(y, n), div(z, m)))
+            buffer = create_darray((A[1:div(x, 2) + 1, :, :]), Blocks(div(x, 2) + 1, div(y, n), div(z, m)))
+            b = create_darray((A[1:div(x, 2) + 1, :, :]), Blocks(div(x, (2*n)) + 1, y, div(z, m)))
+            c = create_darray((A[1:div(x, 2) + 1, :, :]), Blocks(div(x, (2*n)) + 1, div(y, m), z))
+        elseif T <: Real && all(transform -> transform isa FFT!, transforms) #R2C
+            a =  create_darray(A, Blocks(x, div(y, n), div(z, m)))
+            buffer = create_darray(A, Blocks(x, div(y, n), div(z, m)))
+            b = create_darray(A, Blocks(div(x, n), y, div(z, m))) 
+            c = create_darray(A, Blocks(div(x, n), div(y, m), z))
+        else #C2C
+            a =  create_darray(A, Blocks(x, div(y, n), div(z, m)))
+            b =  create_darray(A, Blocks(div(x, n), y, div(z, m)))
+            c =  create_darray(A, Blocks(div(x, n), div(y, m), z))
+        end
+
+        Dagger.spawn_datadeps() do
+            if transforms[1] isa RFFT!
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]), In(z))
+                end
+            elseif T <: Real && all(transform -> transform isa FFT!, transforms)
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]))
+                end
+            else
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+                end
+            end
+
+            for idx in 1:length(b.chunks)
+                b_part = b.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
+            end
+        
+            for idx in 1:length(c.chunks)
+                c_part = c.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(c_part), In(c_part), In(transforms[3]), In(dims[3]))
+            end
+        end
+
+        return collect(c)
+    else
+        error("This function only supports 1D, 2D, and 3D arrays")
+    end
+end
+
+function fft!(
+    A::AbstractArray{T,N},
+    transforms::NTuple{N,Union{FFT!,RFFT!,R2R!}},
+    dims::NTuple{N,Int};
+    decomp::Decomposition = Slab()
+) where {T,N}
+
+    if N == 1
+        x = size(A, 1)
+        a = create_darray(A, Blocks(div(x, W)))
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+            end
+        end
+
+        return collect(a)
+
+    elseif N == 2
+        x, y = size(A)
+
+        if transforms[1] isa RFFT #R2C
+            a = create_darray(A, Blocks(x, div(y, W)))
+            buffer = create_darray((A[1:div(x, 2) + 1, :]), Blocks(div(x, 2) + 1, div(y, W)))
+            b = create_darray((A[1:div(x, 2) + 1, :]), Blocks(div(x, (2*W)) + 1, y))
+        elseif T <: Real && all(transform -> transform isa FFT, transforms) #R2C
+            a = create_darray(A, Blocks(x, div(y, W)))
+            buffer = create_darray(A, Blocks(x, div(y, W)))
+            b = create_darray(A, Blocks(div(x, W), y))
+        else #C2C
+            a = create_darray(A, Blocks(x, div(y, W)))
+            b = create_darray(A, Blocks(div(x, W), y))
+        end
+
+        Dagger.spawn_datadeps() do
+            if transforms[1] isa RFFT
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]), In(y))
+                end
+            elseif T <: Real && all(transform -> transform isa FFT, transforms)
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]))
+                end
+            else
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+                end
+            end
+
+            for idx in 1:length(b.chunks)
+                b_part = b.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
+            end
+        end
+
+        return collect(b)
+
+    elseif N == 3
+        x, y, z = size(A)
+
+        if transforms[1] isa RFFT #R2C
+            a =  create_darray(A, Blocks(x, y, div(z, W)))
+            buffer = create_darray((A[1:div(x, 2) + 1, :, :]), Blocks(div(x, 2) + 1, y, div(z, W)))
+            b = create_darray((A[1:div(x, 2) + 1, :, :]), Blocks((div(div(x, 2) + 1), 2) +1, div(y, m), z))
+        elseif T <: Real && all(transform -> transform isa FFT, transforms) #R2C
+            a =  create_darray(A, Blocks(x, y, div(z, W)))
+            buffer = create_darray(A, Blocks(x, y, div(z, W)))
+            b = create_darray(A, Blocks(div(x, n), div(y, m), z)) 
+        else #C2C
+            a =  create_darray(A, Blocks(x, y, div(z, W)))
+            b =  create_darray(A, Blocks(div(x, n), div(y, m), z))
+        end
+
+        Dagger.spawn_datadeps() do
+            if transforms[1] isa RFFT
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), (dims[1], dims[2]), In(z))
+                end
+            elseif T <: Real && all(transform -> transform isa FFT, transforms)
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), (dims[1], dims[2]))
+                end
+            else
+                for idx in 1:length(a.chunks)
+                    a_part = a.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), (dims[1], dims[2]))
+                end
+            end
+
+            for idx in 1:length(b.chunks)
+                b_part = b.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[3]), In(dims[3]))
+            end
+        end
+
+        return collect(b)
+    else
+        error("This function only supports 1D, 2D, and 3D arrays")
+    end
+end
+
+#out-of-place
+function ifft(
+    A::AbstractArray{T,N},
+    transforms::NTuple{N,Union{IFFT,IRFFT,R2R}},
+    dims::NTuple{N,Int};
+    decomp::Union{Pencil,Nothing} = nothing
+) where {T,N}
+
+    if N == 1
+        x = size(A, 1)
+        a = DArray(A, Blocks(div(x, W)))
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+            end
+            if transforms[1] isa R2R
+                a ./= (2 * x)
+            end
+        end
+
+        return collect(a)
+
+    elseif N == 2
+        x, y = size(A)
+
+        if transforms[1] isa IRFFT  # C2R
+            a = DArray(A, Blocks(div(x, n), y))
+            b = DArray(A, Blocks(x, div(y, m)))
+            buffer = DArray(similar(A, Float64, ((x - 1) * 2, y)), Blocks((x - 1) * 2, div(y, m)))
+        else  # C2C or R2R
+            a = DArray(A, Blocks(div(x, n), y))
+            b = DArray(A, Blocks(x, div(y, m)))
         end
 
         Dagger.spawn_datadeps() do
@@ -580,11 +835,257 @@ function ifft(
                 a_part = a.chunks[idx]
                 Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[2]), In(dims[2]))
             end
+            if transforms[2] isa R2R
+                a ./= (2 * y)
+            end
 
-            if decomp == :pencil
-                Dagger.@spawn transpose_pencils(In(a), Out(b))
+            if transforms[1] isa IRFFT
+                Dagger.@spawn transpose(In(a), Out(b))
+                for idx in 1:length(b.chunks)
+                    b_part = b.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(b_part), In(transforms[1]), In(dims[1]), In(y))
+                end
             else
-                b = a 
+                Dagger.@spawn transpose(In(a), Out(b))
+                for idx in 1:length(b.chunks)
+                    b_part = b.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[1]), In(dims[1]))
+                end
+                if transforms[1] isa R2R
+                    b ./= (2 * x)
+                end
+            end
+        end
+
+        if transforms[1] isa IRFFT
+            return collect(buffer)
+        else
+            return collect(b)
+        end
+
+    elseif N == 3
+        x, y, z = size(A)
+
+        if transforms[1] isa IRFFT  # C2R
+            a = DArray(A, Blocks(div(x, n), div(y, m), z))
+            b = DArray(A, Blocks(div(x, n), y, div(z, m)))
+            c = DArray(A, Blocks(x, div(y, n), div(z, m))) 
+            buffer = DArray(similar(A, Float64, ((x - 1) * 2, y, z)), Blocks((x - 1) * 2, div(y, n), div(z, m)))
+        else  # C2C or R2R
+            a = DArray(A, Blocks(div(x, n), div(y, m), z))
+            b = DArray(A, Blocks(div(x, n), y, div(z, m)))
+            c = DArray(A, Blocks(x, div(y, n), div(z, m))) 
+        end
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[3]), In(dims[3]))
+            end
+            if transforms[1] isa R2R
+                a ./= (2 * x)
+            end
+
+            Dagger.@spawn transpose(In(a), Out(b))
+
+            for idx in 1:length(b.chunks)
+                b_part = b.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
+            end
+            if transforms[2] isa R2R
+                b ./= (2 * y)
+            end
+            if transforms[1] isa IRFFT
+                Dagger.@spawn transpose(In(b), Out(c))
+                for idx in 1:length(c.chunks)
+                    c_part = c.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(c_part), In(transforms[1]), In(dims[1]), In(z))
+                end
+            else
+                Dagger.@spawn transpose(In(b), Out(c))
+                for idx in 1:length(c.chunks)
+                    c_part = c.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(c_part), In(c_part), In(transforms[1]), In(dims[1]))
+                end
+                if transforms[3] isa R2R
+                    c ./= (2 * z)
+                end
+            end
+        end
+
+        if transforms[1] isa IRFFT
+            return collect(buffer)
+        else
+            return collect(c)
+        end
+    else
+        error("This function only supports 1D, 2D, and 3D arrays")
+    end
+end
+
+
+function ifft(
+    A::AbstractArray{T,N},
+    transforms::NTuple{N,Union{IFFT,IRFFT,R2R}},
+    dims::NTuple{N,Int};
+    decomp::Decomposition = Slab()
+) where {T,N}
+
+    if N == 1
+        x = size(A, 1)
+        a = DArray(A, Blocks(div(x, W)))
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+            end
+            if transforms[1] isa R2R
+                a ./= 2 * x
+            end
+        end
+
+        return collect(a)
+
+    elseif N == 2
+        x, y = size(A)
+
+        if transforms[1] isa IRFFT #R2C
+            a = DArray(A, Blocks(x, div(y, W)))
+            b = DArray(A, Blocks(div(x, W), y))
+            buffer = DArray(similar(A, Float64, ((x - 1) * 2, y)), Blocks(div(((x - 1) * 2), W), y))
+        else #C2C
+            a = DArray(A, Blocks(x, div(y, W)))
+            b = DArray(A, Blocks(div(x, W), y))
+        end
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[2]), In(dims[2]))
+            end
+            if transforms[2] isa R2R
+                a ./= 2 * y
+            end
+            if transforms[1] isa IRFFT
+                Dagger.@spawn transpose(In(a), Out(b))
+                for idx in 1:length(b.chunks)
+                    b_part = b.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(b_part), (IRFFT()), In(dims[1]), In(y))
+                end
+            else
+                Dagger.@spawn transpose(In(a), Out(b))
+                for idx in 1:length(b.chunks)
+                    b_part = b.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[1]), In(dims[1]))
+                end
+                if transforms[1] isa R2R
+                    b ./= 2 * x
+                end
+            end
+        end
+
+        if transforms[1] isa IRFFT
+            return collect(buffer)
+        else
+            return collect(b)
+        end
+
+    elseif N == 3
+        x, y, z = size(A)
+
+        if transforms[1] isa IRFFT #R2C
+            a =  DArray(A, Blocks(x, y, div(z, W)))
+            b = DArray(A, Blocks(div(x, n), div(y, m), z))
+            buffer = DArray(similar(A, Float64, ((x - 1) * 2, y, z)), Blocks(div(((x - 1) * 2), n), div(y, m), z))
+        else #C2C
+            a =  DArray(A, Blocks(x, y, div(z, W)))
+            b =  DArray(A, Blocks(div(x, n), div(y, m), z))
+        end
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[3]), (dims[3], dims[2]))
+            end
+            if transforms[3] isa R2R
+                a ./= (2 * z) * (2 * y)
+            end
+            if transforms[1] isa IRFFT
+                Dagger.@spawn transpose(In(a), Out(b))
+                for idx in 1:length(b.chunks)
+                    b_part = b.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(b_part), (IRFFT()), In(dims[1]), In(z))
+                end
+            else
+                Dagger.@spawn transpose(In(a), Out(b))
+                for idx in 1:length(b.chunks)
+                    b_part = b.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[1]), In(dims[1]))
+                end
+                if transforms[1] isa R2R
+                    b ./= 2 * x
+                end
+            end
+        end
+
+        if transforms[1] isa IRFFT
+            return collect(buffer)
+        else
+            return collect(b)
+        end
+    else
+        error("This function only supports 1D, 2D, and 3D arrays")
+    end
+end
+
+#in_place
+function ifft!(
+    A::AbstractArray{T,N},
+    transforms::NTuple{N,Union{IFFT!,IRFFT!,R2R!}},
+    dims::NTuple{N,Int};
+    decomp::Union{Pencil,Nothing} = nothing
+) where {T,N}
+
+    if N == 1
+        x = size(A, 1)
+        a = create_darray(A, Blocks(div(x, W)))
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+            end
+            if transforms[1] isa R2R
+                a ./= (2 * x)
+            end
+        end
+
+        return collect(a)
+
+    elseif N == 2
+        x, y = size(A)
+
+        if transforms[1] isa IRFFT  # C2R
+            a = create_darray(A, Blocks(div(x, n), y))
+            b = create_darray(A, Blocks(x, div(y, m)))
+            buffer = DArray(similar(A, Float64, ((x - 1) * 2, y)), Blocks((x - 1) * 2, div(y, m)))
+        else  # C2C or R2R
+            a = create_darray(A, Blocks(div(x, n), y))
+            b = create_darray(A, Blocks(x, div(y, m)))
+        end
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[2]), In(dims[2]))
+            end
+            if transforms[2] isa R2R
+                a ./= (2 * y)
             end
 
             if transforms[1] isa IRFFT
@@ -593,47 +1094,192 @@ function ifft(
                     buffer_part = buffer.chunks[idx]
                     Dagger.@spawn apply_fft!(Out(buffer_part), In(b_part), In(transforms[1]), In(dims[1]), In(y))
                 end
-                return AbstractCollect(buffer, backend)
             else
                 for idx in 1:length(b.chunks)
                     b_part = b.chunks[idx]
                     Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[1]), In(dims[1]))
                 end
-                return AbstractCollect(b, backend)
+                if transforms[1] isa R2R
+                    b ./= (2 * x)
+                end
             end
         end
-
-    elseif N == 1
-        backend = get_backend(A)
-        x = length(A)
 
         if transforms[1] isa IRFFT
-            a = DArray(A, Blocks(length(A)))
-            buffer = DArray(similar(A, Float64, ((x - 1) * 2)), Blocks(((x - 1) * 2)))
-
-            Dagger.spawn_datadeps() do
-                for idx in 1:length(a.chunks)
-                    a_part = a.chunks[idx]
-                    buffer_part = buffer.chunks[idx]
-                    Dagger.@spawn apply_fft!(Out(buffer_part), In(a_part), In(transforms[1]), In(dims[1]), In(x))
-                end
-            end
-
-            return AbstractCollect(buffer, backend)
+            return collect(buffer)
         else
-            a = DArray(A, Blocks(length(A)))
-
-            Dagger.spawn_datadeps() do
-                for idx in 1:length(a.chunks)
-                    a_part = a.chunks[idx]
-                    Dagger.@spawn apply_fft!(Out(a_part), In(a_part), transforms[1], In(dims[1]))
-                end
-            end
-
-            return AbstractCollect(a, backend)
+            return collect(b)
         end
 
+    elseif N == 3
+        x, y, z = size(A)
+
+        if transforms[1] isa IRFFT  # C2R
+            a = create_darray(A, Blocks(div(x, n), div(y, m), z))
+            b = create_darray(A, Blocks(div(x, n), y, div(z, m)))
+            c = create_darray(A, Blocks(x, div(y, n), div(z, m))) 
+            buffer = DArray(similar(A, Float64, ((x - 1) * 2, y, z)), Blocks((x - 1) * 2, div(y, n), div(z, m)))
+        else  # C2C or R2R
+            a = create_darray(A, Blocks(div(x, n), div(y, m), z))
+            b = create_darray(A, Blocks(div(x, n), y, div(z, m)))
+            c = create_darray(A, Blocks(x, div(y, n), div(z, m))) 
+        end
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[3]), In(dims[3]))
+            end
+            if transforms[1] isa R2R
+                a ./= (2 * x)
+            end
+
+            for idx in 1:length(b.chunks)
+                b_part = b.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[2]), In(dims[2]))
+            end
+            if transforms[2] isa R2R
+                b ./= (2 * y)
+            end
+
+            if transforms[1] isa IRFFT
+                for idx in 1:length(c.chunks)
+                    c_part = c.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(c_part), In(transforms[1]), In(dims[1]), In(z))
+                end
+            else
+                for idx in 1:length(c.chunks)
+                    c_part = c.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(c_part), In(c_part), In(transforms[1]), In(dims[1]))
+                end
+                if transforms[3] isa R2R
+                    c ./= (2 * z)
+                end
+            end
+        end
+
+        if transforms[1] isa IRFFT
+            return collect(buffer)
+        else
+            return collect(c)
+        end
     else
-        throw(ArgumentError("IFFT not implemented for $(N)-dimensional arrays"))
+        error("This function only supports 1D, 2D, and 3D arrays")
+    end
+end
+
+function ifft!(
+    A::AbstractArray{T,N},
+    transforms::NTuple{N,Union{IFFT!,IRFFT!,R2R!}},
+    dims::NTuple{N,Int};
+    decomp::Decomposition = Slab()
+) where {T,N}
+
+    if N == 1
+        x = size(A, 1)
+        a = create_darray(A, Blocks(div(x, W)))
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[1]), In(dims[1]))
+            end
+            if transforms[1] isa R2R!
+                a ./= 2 * x
+            end
+        end
+
+        return collect(a)
+
+    elseif N == 2
+        x, y = size(A)
+
+        if transforms[1] isa IRFFT  # C2R
+            a = create_darray(A, Blocks(div(x, n), y))
+            b = create_darray(A, Blocks(x, div(y, m)))
+            buffer = DArray(similar(A, Float64, ((x - 1) * 2, y)), Blocks((x - 1) * 2, div(y, m)))
+        else  # C2C or R2R
+            a = create_darray(A, Blocks(div(x, n), y))
+            b = create_darray(A, Blocks(x, div(y, m)))
+        end
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[2]), In(dims[2]))
+            end
+            if transforms[2] isa R2R!
+                a ./= 2 * y
+            end
+
+            if transforms[1] isa IRFFT!
+                for idx in 1:length(b.chunks)
+                    b_part = b.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(b_part), (IRFFT!()), In(dims[1]), In(y))
+                end
+            else
+                for idx in 1:length(b.chunks)
+                    b_part = b.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[1]), In(dims[1]))
+                end
+                if transforms[1] isa R2R!
+                    b ./= 2 * x
+                end
+            end
+        end
+
+        if transforms[1] isa IRFFT!
+            return collect(buffer)
+        else
+            return collect(b)
+        end
+
+    elseif N == 3
+        x, y, z = size(A)
+
+        if transforms[1] isa IRFFT! #R2C
+            a =  create_darray(A, Blocks(x, y, div(z, W)))
+            b = create_darray(A, Blocks(div(x, n), div(y, m), z))
+            buffer = DArray(similar(A, Float64, ((x - 1) * 2, y, z)), Blocks(div(((x - 1) * 2), n), div(y, m), z))
+        else #C2C
+            a =  create_darray(A, Blocks(x, y, div(z, W)))
+            b =  create_darray(A, Blocks(div(x, n), div(y, m), z))
+        end
+
+        Dagger.spawn_datadeps() do
+            for idx in 1:length(a.chunks)
+                a_part = a.chunks[idx]
+                Dagger.@spawn apply_fft!(Out(a_part), In(a_part), In(transforms[3]), (dims[3], dims[2]))
+            end
+            if transforms[3] isa R2R!
+                a ./= (2 * z) * (2 * y)
+            end
+
+            if transforms[1] isa IRFFT!
+                for idx in 1:length(b.chunks)
+                    b_part = b.chunks[idx]
+                    buffer_part = buffer.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(buffer_part), In(b_part), (IRFFT!()), In(dims[1]), In(z))
+                end
+            else
+                for idx in 1:length(b.chunks)
+                    b_part = b.chunks[idx]
+                    Dagger.@spawn apply_fft!(Out(b_part), In(b_part), In(transforms[1]), In(dims[1]))
+                end
+                if transforms[1] isa R2R!
+                    b ./= 2 * x
+                end
+            end
+        end
+
+        if transforms[1] isa IRFFT!
+            return collect(buffer)
+        else
+            return collect(b)
+        end
+    else
+        error("This function only supports 1D, 2D, and 3D arrays")
     end
 end
