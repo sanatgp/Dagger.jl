@@ -3,10 +3,10 @@
 #module DaggerFFT
 #__precompile__(false)
 using Distributed
-using KernelAbstractions, AbstractFFTs, LinearAlgebra, FFTW, Dagger, CUDA, CUDA.CUFFT, Random, GPUArrays, AMDGPU
+@everywhere using KernelAbstractions, AbstractFFTs, LinearAlgebra, FFTW, Dagger, CUDA, CUDA.CUFFT, Random, GPUArrays
 
 
-const R2R_SUPPORTED_KINDS = (
+@everywhere const R2R_SUPPORTED_KINDS = (
     FFTW.DHT,
     FFTW.REDFT00,
     FFTW.REDFT01,
@@ -35,23 +35,23 @@ RODFT01 (Type III DST): Backward transform (inverse of RODFT10)
 RODFT11 (Type IV DST): Its own inverse (symmetric)
 """
 
-struct FFT end
-struct RFFT end
-struct IRFFT end
-struct IFFT end
-struct FFT! end
-struct RFFT! end
-struct IRFFT! end
-struct IFFT! end
+@everywhere struct FFT end
+@everywhere struct RFFT end
+@everywhere struct IRFFT end
+@everywhere struct IFFT end
+@everywhere struct FFT! end
+@everywhere struct RFFT! end
+@everywhere struct IRFFT! end
+@everywhere struct IFFT! end
 
-abstract type Decomposition end
+@everywhere abstract type Decomposition end
 
-struct Pencil <: Decomposition end
-struct Slab <: Decomposition end
+@everywhere struct Pencil <: Decomposition end
+@everywhere struct Slab <: Decomposition end
 
 export FFT, RFFT, IRFFT, IFFT, FFT!, RFFT!, IRFFT!, IFFT!, fft, ifft, R2R, R2R!
 
-struct R2R{K}
+@everywhere struct R2R{K}
     kind::K
     function R2R(kind::K) where {K}
         if kind ∉ R2R_SUPPORTED_KINDS
@@ -61,7 +61,7 @@ struct R2R{K}
     end
 end
 
-struct R2R!{K}
+@everywhere struct R2R!{K}
     kind::K
     function R2R!(kind::K) where {K}
         if kind ∉ R2R_SUPPORTED_KINDS
@@ -72,8 +72,8 @@ struct R2R!{K}
 end
 
 # Get the number of processors
-const W = Distributed.nprocs()
-function find_factors(N)
+@everywhere const W = Distributed.nprocs()
+@everywhere function find_factors(N)
     n = Int(floor(sqrt(N)))
     while N % n != 0
         n -= 1
@@ -82,9 +82,9 @@ function find_factors(N)
     return n, m
 end
 
-const n, m = find_factors(W)
+@everywhere const n, m = find_factors(W)
 
-function plan_transform(transform, A, dims; kwargs...)
+@everywhere function plan_transform(transform, A, dims; kwargs...)
         if transform isa FFT
             return plan_fft(A, dims; kwargs...)
         elseif transform isa IFFT
@@ -102,7 +102,7 @@ function plan_transform(transform, A, dims; kwargs...)
         end
 end
 
-function plan_transform(transform, A, dims, n; kwargs...)
+@everywhere function plan_transform(transform, A, dims, n; kwargs...)
         if transform isa RFFT
             return plan_rfft(A, dims; kwargs...)
         elseif transform isa IRFFT
@@ -115,7 +115,7 @@ end
 kind(transform::R2R) = transform.kind
 kind(transform::R2R!) = transform.kind
 
-function plan_transform(transform::Union{R2R, R2R!}, A, dims; kwargs...)
+@everywhere function plan_transform(transform::Union{R2R, R2R!}, A, dims; kwargs...)
     kd = kind(transform)
     if transform isa R2R
         return FFTW.plan_r2r(A, kd, dims; kwargs...)
@@ -127,7 +127,7 @@ function plan_transform(transform::Union{R2R, R2R!}, A, dims; kwargs...)
 end
 
 
-function create_darray(A::AbstractArray{T,N}, blocks::Blocks{N}) where {T,N}
+@everywhere function create_darray(A::AbstractArray{T,N}, blocks::Blocks{N}) where {T,N}
     domain = ArrayDomain(map(Base.OneTo, size(A)))
     
     #calculate subdomain
@@ -162,7 +162,7 @@ function create_darray(A::AbstractArray{T,N}, blocks::Blocks{N}) where {T,N}
 end
 
 
-function apply_fft!(out_part, a_part, transform, dim)
+@everywhere function apply_fft!(out_part, a_part, transform, dim)
     plan = plan_transform(transform, a_part, dim)
     if transform isa Union{FFT!, IFFT!}
         out_part .= plan * a_part  # In-place transform
@@ -173,13 +173,13 @@ function apply_fft!(out_part, a_part, transform, dim)
     end
 end
 
-function apply_fft!(out_part, a_part, transform, dim, n)
+@everywhere function apply_fft!(out_part, a_part, transform, dim, n)
     plan = plan_transform(transform, a_part, dim, n)
     out_part .= plan * a_part 
 end
 
 
-@kernel function transpose_kernel!(dst, src, src_size_x, src_size_y, src_size_z,
+@everywhere @kernel function transpose_kernel!(dst, src, src_size_x, src_size_y, src_size_z,
     dst_size_x, dst_size_y, dst_size_z,
     src_offset_x, src_offset_y, src_offset_z,
     dst_offset_x, dst_offset_y, dst_offset_z)
@@ -199,7 +199,7 @@ end
     end
 end
 
-function transpose(src::DArray{T,3}, dst::DArray{T,3})
+@everywhere function transpose(src::DArray{T,3}, dst::DArray{T,3}) where T
     for (src_idx, src_chunk) in enumerate(src.chunks)
         src_data = fetch(src_chunk)
         for (dst_idx, dst_chunk) in enumerate(dst.chunks)
@@ -240,12 +240,12 @@ function transpose(src::DArray{T,3}, dst::DArray{T,3})
 end
 
 
-function relative_indices(sub_domain, full_domain)
+@everywhere function relative_indices(sub_domain, full_domain)
     return map(pair -> (pair[1].start:pair[1].stop) .- (pair[2].start - 1), 
     zip(sub_domain.indexes, full_domain.indexes))
 end
 
-@kernel function transpose_kernel_2d!(dst, src, src_size_x, src_size_y,
+@everywhere @kernel function transpose_kernel_2d!(dst, src, src_size_x, src_size_y,
     dst_size_x, dst_size_y,
     src_offset_x, src_offset_y,
     dst_offset_x, dst_offset_y)
@@ -263,7 +263,7 @@ end
     end
 end
 
-function transpose(src::DArray{T,2}, dst::DArray{T,2}) where T
+@everywhere function transpose(src::DArray{T,2}, dst::DArray{T,2}) where T
     for (src_idx, src_chunk) in enumerate(src.chunks)
         src_data = fetch(src_chunk)
         for (dst_idx, dst_chunk) in enumerate(dst.chunks)
@@ -314,7 +314,7 @@ or    transforms = (RFFT(), FFT(), FFT())
     dims = (1, 2, 3)
 "
 #out-of-place
-function fft(
+@everywhere function fft(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{FFT,RFFT,R2R}},
     dims::NTuple{N,Int};
@@ -443,7 +443,7 @@ function fft(
     end
 end
 
-function fft(
+@everywhere function fft(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{FFT,RFFT,R2R}},
     dims::NTuple{N,Int};
@@ -562,7 +562,7 @@ function fft(
 end
 
 #in-place
-function fft!(
+@everywhere function fft!(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{FFT!,RFFT!,R2R!}},
     dims::NTuple{N,Int};
@@ -682,7 +682,7 @@ function fft!(
     end
 end
 
-function fft!(
+@everywhere function fft!(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{FFT!,RFFT!,R2R!}},
     dims::NTuple{N,Int};
@@ -795,7 +795,7 @@ function fft!(
 end
 
 #out-of-place
-function ifft(
+@everywhere function ifft(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{IFFT,IRFFT,R2R}},
     dims::NTuple{N,Int};
@@ -926,7 +926,7 @@ function ifft(
 end
 
 
-function ifft(
+@everywhere function ifft(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{IFFT,IRFFT,R2R}},
     dims::NTuple{N,Int};
@@ -1044,7 +1044,7 @@ function ifft(
 end
 
 #in_place
-function ifft!(
+@everywhere function ifft!(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{IFFT!,IRFFT!,R2R!}},
     dims::NTuple{N,Int};
@@ -1169,7 +1169,7 @@ function ifft!(
     end
 end
 
-function ifft!(
+@everywhere function ifft!(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{IFFT!,IRFFT!,R2R!}},
     dims::NTuple{N,Int};
