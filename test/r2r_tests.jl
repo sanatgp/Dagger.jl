@@ -35,7 +35,7 @@ include("../src/fft.jl")
         @test isapprox(result_dct, expected_dct, rtol=1e-10)
         
         # Backward transform
-        #result_idct = ifft(result_dct, (R2R(FFTW.REDFT01), R2R(FFTW.REDFT01), R2R(FFTW.REDFT01)), (1, 2, 3))
-       # @test isapprox(input, result_idct, rtol=1e-10)
+        result_idct = ifft(result_dct, (R2R(FFTW.REDFT01), R2R(FFTW.REDFT01), R2R(FFTW.REDFT01)), (1, 2, 3))
+        @test isapprox(input, result_idct, rtol=1e-10)
     end
 end
