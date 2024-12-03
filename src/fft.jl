@@ -49,7 +49,6 @@ RODFT11 (Type IV DST): Its own inverse (symmetric)
 @everywhere struct Pencil <: Decomposition end
 @everywhere struct Slab <: Decomposition end
 
-export FFT, RFFT, IRFFT, IFFT, FFT!, RFFT!, IRFFT!, IFFT!, fft, ifft, R2R, R2R!
 
 @everywhere struct R2R{K}
     kind::K
@@ -70,6 +69,9 @@ end
         new{K}(kind)
     end
 end
+
+export FFT, RFFT, IRFFT, IFFT, FFT!, RFFT!, IRFFT!, IFFT!, fft, ifft, R2R, R2R!, Pencil, Slab
+
 
 # Get the number of processors
 @everywhere const W = Distributed.nprocs()
@@ -318,7 +320,7 @@ or    transforms = (RFFT(), FFT(), FFT())
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{FFT,RFFT,R2R}},
     dims::NTuple{N,Int};
-    decomp::Union{Pencil,Nothing} = nothing
+    decomp::Pencil = Pencil()
 ) where {T,N}
 
     if N == 1
@@ -442,12 +444,12 @@ or    transforms = (RFFT(), FFT(), FFT())
         error("This function only supports 1D, 2D, and 3D arrays")
     end
 end
-
+#=
 @everywhere function fft(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{FFT,RFFT,R2R}},
     dims::NTuple{N,Int};
-    decomp::Slab
+    decomp::Slab = Slab()
 ) where {T,N}
 
     if N == 1
@@ -560,13 +562,13 @@ end
         error("This function only supports 1D, 2D, and 3D arrays")
     end
 end
-
+=#
 #in-place
 @everywhere function fft!(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{FFT!,RFFT!,R2R!}},
     dims::NTuple{N,Int};
-    decomp::Union{Pencil,Nothing} = nothing
+    decomp::Pencil = Pencil()
 ) where {T,N}
 
     if N == 1
@@ -681,12 +683,12 @@ end
         error("This function only supports 1D, 2D, and 3D arrays")
     end
 end
-
+#=
 @everywhere function fft!(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{FFT!,RFFT!,R2R!}},
     dims::NTuple{N,Int};
-    decomp::Decomposition = Slab()
+    decomp::Slab = Slab()
 ) where {T,N}
 
     if N == 1
@@ -793,13 +795,13 @@ end
         error("This function only supports 1D, 2D, and 3D arrays")
     end
 end
-
+=#
 #out-of-place
 @everywhere function ifft(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{IFFT,IRFFT,R2R}},
     dims::NTuple{N,Int};
-    decomp::Union{Pencil,Nothing} = nothing
+    decomp::Pencil = Pencil()
 ) where {T,N}
 
     if N == 1
@@ -925,12 +927,12 @@ end
     end
 end
 
-
+#=
 @everywhere function ifft(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{IFFT,IRFFT,R2R}},
     dims::NTuple{N,Int};
-    decomp::Decomposition = Slab()
+    decomp::Slab = Slab()
 ) where {T,N}
 
     if N == 1
@@ -1042,13 +1044,13 @@ end
         error("This function only supports 1D, 2D, and 3D arrays")
     end
 end
-
+=#
 #in_place
 @everywhere function ifft!(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{IFFT!,IRFFT!,R2R!}},
     dims::NTuple{N,Int};
-    decomp::Union{Pencil,Nothing} = nothing
+    decomp::Pencil = Pencil()
 ) where {T,N}
 
     if N == 1
@@ -1168,12 +1170,12 @@ end
         error("This function only supports 1D, 2D, and 3D arrays")
     end
 end
-
+#=
 @everywhere function ifft!(
     A::AbstractArray{T,N},
     transforms::NTuple{N,Union{IFFT!,IRFFT!,R2R!}},
     dims::NTuple{N,Int};
-    decomp::Decomposition = Slab()
+    decomp::Slab = Slab()
 ) where {T,N}
 
     if N == 1
@@ -1283,3 +1285,6 @@ end
         error("This function only supports 1D, 2D, and 3D arrays")
     end
 end
+=#
+
+#end
