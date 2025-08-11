@@ -84,16 +84,25 @@ mutable struct Thunk
                    affinity=nothing,
                    eager_ref=nothing,
                    processor=nothing,
+                   memory_space=nothing,
                    scope=nothing,
                    options=nothing,
                    propagates=(),
                    kwargs...
                   )
-        if !isa(f, Chunk) && (!isnothing(processor) || !isnothing(scope))
-            f = tochunk(f,
-                        something(processor, OSProc()),
-                        something(scope, DefaultScope()))
-        end
+        #FIXME: dont force unwrap with fetch
+        f = fetch(f)
+        if (!isnothing(processor) || !isnothing(scope) || !isnothing(memory_space))
+            if !isnothing(processor)
+                f = tochunk(f,
+                            processor,
+                            something(scope, DefaultScope()))
+            else
+                f = tochunk(f,
+                            something(memory_space, default_memory_space(f)),
+                                      something(scope, DefaultScope()))
+            end
+        end 
         xs = Base.mapany(identity, xs)
         syncdeps_set = Set{Any}(filterany(is_task_or_chunk, Base.mapany(last, xs)))
         if syncdeps !== nothing
@@ -371,12 +380,10 @@ function _par(mod, ex::Expr; lazy=true, recur=true, opts=())
     body = nothing
     arg1 = nothing
     arg2 = nothing
-    value = nothing
     if recur && @capture(ex, f_(allargs__)) ||
                 @capture(ex, f_(allargs__) do cargs_ body_ end) ||
                 @capture(ex, allargs__->body_) ||
                 @capture(ex, arg1_[allargs__]) ||
-                @capture(ex, arg1_[allargs__] = value_) ||
                 @capture(ex, arg1_.arg2_) ||
                 @capture(ex, (;allargs__)) ||
                 @capture(ex, bf_.(allargs__))
@@ -389,13 +396,8 @@ function _par(mod, ex::Expr; lazy=true, recur=true, opts=())
                 # Getproperty (A.B)
                 f = Base.getproperty
                 allargs = Any[arg1, QuoteNode(arg2)]
-            elseif value !== nothing
-                # setindex! (A[2,3] = 4)
-                f = _setindex!_return_value
-                pushfirst!(allargs, value)
-                pushfirst!(allargs, arg1)
             else
-                # getindex (A[2,3])
+                # Indexing (A[2,3])
                 f = Base.getindex
                 pushfirst!(allargs, arg1)
             end
@@ -451,11 +453,6 @@ _par(mod, ex; kwargs...) = throw(ArgumentError("Invalid Dagger task expression: 
 _par_inner(mod, ex; kwargs...) = ex
 _par_inner(mod, ex::Expr; kwargs...) = _par(mod, ex; kwargs...)
 
-function _setindex!_return_value(A, value, idxs...)
-    setindex!(A, value, idxs...)
-    return value
-end
-
 """
     Dagger.spawn(f, args...; kwargs...) -> DTask
 
@@ -479,12 +476,21 @@ function spawn(f, args...; kwargs...)
     # Wrap f in a Chunk if necessary
     processor = haskey(options, :processor) ? options.processor : nothing
     scope = haskey(options, :scope) ? options.scope : nothing
-    if !isnothing(processor) || !isnothing(scope)
-        f = tochunk(f,
-                    something(processor, get_options(:processor, OSProc())),
-                    something(scope, get_options(:scope, DefaultScope())))
+    memory_space = haskey(options, :memory_space) ? options.memory_space : nothing
+    #FIXME: don't for unwrap with fetch
+    f = fetch(f)
+    if (!isnothing(processor) || !isnothing(scope) || !isnothing(memory_space))
+        if !isnothing(processor)
+            f = tochunk(f,
+                        processor,
+                        something(scope, DefaultScope()))
+        else
+            f = tochunk(f,
+                        something(memory_space, default_memory_space(f)),
+                                  something(scope, DefaultScope()))
+        end
     end
-
+   
     # Process the args and kwargs into Pair form
     args_kwargs = args_kwargs_to_pairs(args, kwargs)
 
@@ -493,6 +499,9 @@ function spawn(f, args...; kwargs...)
     options = NamedTuple(filter(opt->opt[1] != :task_queue, Base.pairs(options)))
     propagates = filter(prop->prop != :task_queue, propagates)
     options = merge(options, (;propagates))
+    if !haskey(options, :acceleration)
+        options = merge(options, (;acceleration=current_acceleration()))
+    end
 
     # Construct task spec and handle
     spec = DTaskSpec(f, args_kwargs, options)
@@ -570,14 +579,7 @@ function show_thunk(io::IO, t)
     end
     print(io, ")")
 end
-function Base.show(io::IO, t::Thunk)
-    lazy_level = parse(Int, get(ENV, "JULIA_DAGGER_SHOW_THUNK_VERBOSITY", "0"))
-    if lazy_level == 0
-        show_thunk(io, t)
-    else
-        show_thunk(IOContext(io, :lazy_level => lazy_level), t)
-    end
-end
+Base.show(io::IO, t::Thunk) = show_thunk(io, t)
 Base.summary(t::Thunk) = repr(t)
 
 inputs(x::Thunk) = x.inputs
