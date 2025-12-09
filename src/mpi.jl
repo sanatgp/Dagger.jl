@@ -1,5 +1,7 @@
 #mpi.jl
 using MPI
+const MPI_UID = ScopedValue{Int64}(0)
+using Base: with
 
 const CHECK_UNIFORMITY = TaskLocalValue{Bool}(()->false)
 function check_uniformity!(check::Bool=true)
@@ -357,8 +359,16 @@ end
 WeakChunk(c::Chunk{T,H}) where {T,H<:MPIRef} = WeakChunk(c.handle.rank, c.handle.id.id, WeakRef(c))
 
 function poolget(ref::MPIRef)
-    @assert ref.rank == MPI.Comm_rank(ref.comm) "MPIRef rank mismatch"
-    poolget(ref.innerRef)
+    current_rank = MPI.Comm_rank(ref.comm)
+    if ref.rank != current_rank
+        error("MPIRef rank mismatch: ref.rank=$(ref.rank), current_rank=$current_rank. " *
+              "Cannot access data from rank $(ref.rank) on rank $current_rank. " *
+              "This indicates a task scheduling problem - ensure tasks are scheduled on ranks that own the data.")
+    end
+    if ref.innerRef === nothing
+        error("MPIRef has no inner reference (innerRef is nothing) on rank $(ref.rank)")
+    end
+    return poolget(ref.innerRef)
 end
 
 function move!(dep_mod, dst::MPIMemorySpace, src::MPIMemorySpace, dstarg::Chunk, srcarg::Chunk)
@@ -388,14 +398,47 @@ move(::MPIOSProc, ::MPIProcessor, x::Chunk{<:Union{Function,Type}}) = poolget(x.
 #TODO: out of place MPI move
 function move(src::MPIOSProc, dst::MPIProcessor, x::Chunk)
     @assert src.comm == dst.comm "Multi comm move not supported"
-    if Sch.SCHED_MOVE[]
-        if dst.rank == MPI.Comm_rank(dst.comm) 
+    current_rank = MPI.Comm_rank(dst.comm)
+    
+    # Enhanced rank validation for MPIRef chunks
+    if x.handle isa MPIRef
+        chunk_rank = x.handle.rank
+        
+        if Sch.SCHED_MOVE[]
+            # In scheduling mode, we should only access data if we're on the right rank
+            if dst.rank != current_rank
+          #      @warn "Move scheduled for rank $(dst.rank) but executing on rank $current_rank"
+                return nothing  # Return placeholder for non-local execution
+            end
+            
+            # We can only safely get data if the chunk is local
+            if chunk_rank == current_rank
+                return poolget(x.handle)
+            else
+                error("Cannot move chunk from rank $chunk_rank - not local to current rank $current_rank. " *
+                      "This indicates a task scheduling problem.")
+            end
+        else
+            # In non-scheduling mode, validate rank consistency
+            if src.rank != current_rank
+                error("Source rank mismatch: expected $(src.rank), got $current_rank")
+            end
+            if src.rank != chunk_rank || chunk_rank != dst.rank
+                error("Rank mismatch: src.rank=$(src.rank), chunk_rank=$chunk_rank, dst.rank=$(dst.rank)")
+            end
             return poolget(x.handle)
         end
-    else 
-        @assert src.rank == MPI.Comm_rank(src.comm) "Unwraping not permited"
-        @assert src.rank == x.handle.rank == dst.rank 
-        return poolget(x.handle)
+    else
+        # For non-MPIRef chunks, use original logic
+        if Sch.SCHED_MOVE[]
+            if dst.rank == current_rank 
+                return poolget(x.handle)
+            end
+        else 
+            @assert src.rank == current_rank "Unwraping not permited"
+            @assert src.rank == dst.rank 
+            return poolget(x.handle)
+        end
     end
 end
 
@@ -414,13 +457,17 @@ move(::MPIProcessor, ::MPIProcessor, x::Chunk{<:Union{Function,Type}}) = poolget
 
 function move(src::MPIProcessor, dst::MPIProcessor, x::Chunk)
     @assert src.rank == dst.rank "Unwrapping not permitted"
+    current_rank = MPI.Comm_rank(dst.comm)
+    
     if Sch.SCHED_MOVE[]
-        if dst.rank == MPI.Comm_rank(dst.comm)
+        if dst.rank == current_rank
             return poolget(x.handle)
         end
     else
-        @assert src.rank == MPI.Comm_rank(src.comm) "Unwrapping not permitted"
-        @assert src.rank == x.handle.rank == dst.rank
+        @assert src.rank == current_rank "Unwrapping not permitted"
+        if x.handle isa MPIRef
+            @assert src.rank == x.handle.rank == dst.rank "Rank consistency check failed"
+        end
         return poolget(x.handle)
     end
 end
@@ -430,6 +477,12 @@ function execute!(proc::MPIProcessor, f, args...; kwargs...)
     local_rank = MPI.Comm_rank(proc.comm)
     tag = abs(Base.unsafe_trunc(Int32, hash(peek_ref_id())))
     tid = sch_handle().thunk_id.id
+    
+    # Validate that we should execute on this rank
+    if local_rank != proc.rank && f !== move!
+      #  @warn "Task scheduled for rank $(proc.rank) but executing on rank $local_rank"
+    end
+    
     if local_rank == proc.rank || f === move!
         result = execute!(proc.innerProc, f, args...; kwargs...)
         bcast_send_yield(typeof(result), proc.comm, proc.rank, tag)
@@ -644,4 +697,3 @@ function Base.collect(x::Dagger.DArray{T,3};
         return result
     end
 end
-
